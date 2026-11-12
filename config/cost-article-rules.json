@@ -1,0 +1,96 @@
+{
+  "version": "cost-articles-v1",
+  "minimum_score": 3,
+  "articles": {
+    "0200": {
+      "name": "Оплата труда",
+      "signals": [
+        {
+          "id": "wage_statement_title",
+          "pattern": "расчетн\\w*\\s+ведомост\\w*\\s+по\\s+оплате\\s+труда",
+          "weight": 5
+        },
+        {
+          "id": "wage_article_codes",
+          "pattern": "\\b020[12]\\b",
+          "weight": 2
+        },
+        {
+          "id": "wage_semantics",
+          "pattern": "заработн\\w*\\s+плат|резерв\\w*\\s+отпуск",
+          "weight": 2
+        }
+      ]
+    },
+    "0300": {
+      "name": "Страховые взносы",
+      "signals": [
+        {
+          "id": "insurance_calculation_title",
+          "pattern": "расчет\\s+страхов\\w*\\s+взнос",
+          "weight": 5
+        },
+        {
+          "id": "insurance_article_code",
+          "pattern": "\\b0300\\b",
+          "weight": 3
+        },
+        {
+          "id": "insurance_semantics",
+          "pattern": "начислено\\s+взносов|база\\s+начислен",
+          "weight": 2
+        }
+      ]
+    },
+    "0800": {
+      "name": "Общепроизводственные затраты",
+      "signals": [
+        {
+          "id": "production_purpose",
+          "pattern": "производственн\\w*\\s+(?:назначен|деятельност|операц)|выполнен\\w*\\s+работ\\w*\\s+этапа",
+          "weight": 3
+        },
+        {
+          "id": "equipment_maintenance",
+          "pattern": "(?:эксплуатационн|техническ)\\w*\\s+обслуживан|работоспособност\\w*\\s+оборудован",
+          "weight": 4
+        },
+        {
+          "id": "measurement_equipment",
+          "pattern": "калибровк\\w*\\s+измерительн\\w*\\s+оборудован|специализированн\\w*\\s+измерительн\\w*\\s+оборудован|испытательн\\w*\\s+стенд",
+          "weight": 4
+        }
+      ]
+    },
+    "0900": {
+      "name": "Общехозяйственные затраты",
+      "signals": [
+        {
+          "id": "administrative_support",
+          "pattern": "административн\\w*\\s+(?:сопровожден|групп|контур)|документооборот",
+          "weight": 4
+        },
+        {
+          "id": "management_support",
+          "pattern": "управлени\\w*\\s+договор|организационно[- ]управленческ\\w*\\s+сопровожден|управленческ\\w*\\s+материал",
+          "weight": 4
+        },
+        {
+          "id": "general_business_it",
+          "pattern": "ит[- ]инфраструктур|программн\\w*\\s+лицензи|общехозяйственн\\w*\\s+обеспечен",
+          "weight": 4
+        },
+        {
+          "id": "administrative_communications",
+          "pattern": "услуг\\w*\\s+связи|информационн\\w*\\s+обеспечен",
+          "weight": 3
+        },
+        {
+          "id": "coordination_reporting",
+          "pattern": "координаци\\w*\\s+отчетност|отчетн\\w*\\s+цикл|внутренн\\w*\\s+согласован",
+          "weight": 2
+        }
+      ]
+    }
+  }
+}

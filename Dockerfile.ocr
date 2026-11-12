@@ -1,0 +1,32 @@
+FROM python:3.11-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
+    PADDLE_DEVICE=cpu \
+    PYTHONPATH=/app/src
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+        libgomp1 \
+        libgl1 \
+        libglib2.0-0 \
+        poppler-utils \
+        tesseract-ocr \
+        tesseract-ocr-eng \
+        tesseract-ocr-rus \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.ocr.txt /app/requirements.ocr.txt
+RUN python -m pip install --no-cache-dir --upgrade pip==26.3 \
+    && python -m pip install --no-cache-dir -r /app/requirements.ocr.txt
+
+COPY src /app/src
+COPY poc/linux-ocr-benchmark /app/poc/linux-ocr-benchmark
+
+RUN python -m financial_verification.ocr --provider paddle --warmup
+
+ENTRYPOINT ["python", "/app/poc/linux-ocr-benchmark/run_benchmark.py"]

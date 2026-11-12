@@ -1,0 +1,17 @@
+{
+  "labor_intensity": "34.14",
+  "materials": "0.00",
+  "wages_total": "5558474.83",
+  "wages_without_reserve": "5248019.04",
+  "base_wages": "5054470.26",
+  "additional_wages": "193548.78",
+  "leave_reserve": "310455.79",
+  "insurance_total": "1671359.96",
+  "insurance_without_reserve": "1578126.37",
+  "insurance_base_wages": "1526450.09",
+  "insurance_additional_wages": "51676.28",
+  "insurance_leave_reserve": "93233.59",
+  "overhead_0800": "1145798.10",
+  "administrative_0900": "3204744.51",
+  "row_total": "11580377.40"
+}

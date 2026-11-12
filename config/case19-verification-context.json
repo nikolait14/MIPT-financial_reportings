@@ -1,0 +1,72 @@
+{
+  "case_id": "case-19",
+  "report_file": "01_Карточка_учета_фактических_затрат_этап_3.pdf",
+  "target_row_label": "3 этап, 2026 г.",
+  "contract_number": "24/03/15-01",
+  "period_from": "2026-01-01",
+  "period_to": "2026-05-31",
+  "report_row_fields": [
+    "labor_intensity",
+    "materials",
+    "wages_total",
+    "wages_without_reserve",
+    "base_wages",
+    "additional_wages",
+    "leave_reserve",
+    "insurance_total",
+    "insurance_without_reserve",
+    "insurance_base_wages",
+    "insurance_additional_wages",
+    "insurance_leave_reserve",
+    "overhead_0800",
+    "administrative_0900",
+    "row_total"
+  ],
+  "article_report_fields": {
+    "0200": "wages_total",
+    "0300": "insurance_total",
+    "0800": "overhead_0800",
+    "0900": "administrative_0900"
+  },
+  "total_report_field": "row_total",
+  "detail_aggregation_checks": [
+    {
+      "check_id": "base_wages",
+      "check_name": "Основная заработная плата",
+      "source_line_item_codes": [
+        "0201"
+      ],
+      "report_field_ids": [
+        "base_wages"
+      ]
+    },
+    {
+      "check_id": "additional_wages_and_leave_reserve",
+      "check_name": "Дополнительная заработная плата и резерв отпусков совместно",
+      "source_line_item_codes": [
+        "0202"
+      ],
+      "report_field_ids": [
+        "additional_wages",
+        "leave_reserve"
+      ]
+    }
+  ],
+  "insufficient_detail_fields": [
+    "labor_intensity",
+    "materials",
+    "wages_without_reserve",
+    "additional_wages",
+    "leave_reserve",
+    "insurance_without_reserve",
+    "insurance_base_wages",
+    "insurance_additional_wages",
+    "insurance_leave_reserve"
+  ],
+  "oracle_patterns": [
+    "!Правильные_ответы_и_разбор.xlsx"
+  ],
+  "metadata_prefixes": [
+    "00_"
+  ]
+}

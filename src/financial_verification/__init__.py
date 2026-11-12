@@ -1,0 +1,2 @@
+"""Financial report verification primitives."""
+

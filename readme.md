@@ -3,9 +3,11 @@
 ## Текущее состояние реализации
 
 - Реализован локальный PoC распознавания целевой строки КФЗ: 15 из 15 ячеек извлекаются точно в 300, 400 и 600 DPI.
+- Реализован Linux/Docker OCR-контур: PaddleOCR 300 DPI выбран основным, Tesseract 400 DPI — независимым full-page fallback; оба варианта дали 15/15 в трех повторах.
+- Production OCR не использует эталонные суммы, автоматически переключается на fallback и выдает совместимый со сверкой `report-ocr.json`.
 - Реализован `VerificationContext` для договора, периода, отчета и целевой строки.
 - Реализован реестр документов с SHA-256, уникальными идентификаторами и доказательствами извлечения.
-- DOCX и XLSX обрабатываются нативно, PDF и PNG — локальным Apple Vision OCR.
+- DOCX и XLSX обрабатываются нативно; для отчета на Linux используется локальный PaddleOCR/Tesseract, Apple Vision сохранен как macOS-baseline для первичных PDF/PNG.
 - Эталонный файл физически исключается из рабочего контура.
 - Реализованы `DUPLICATE_DOCUMENT`, `OUT_OF_PERIOD`, `WRONG_CONTRACT`, `EXTRACTION_INCOMPLETE` и изоляция ошибки отдельного файла.
 - Реализованы нормализация операций, доказательная классификация в `0200/0300/0800/0900`, точное агрегирование через `Decimal` и сверка с КФЗ.
@@ -25,16 +27,27 @@
 - итоговое заключение — `REPORT_UNRELIABLE`;
 - доступная внутренняя детализация зарплаты проверена, а неподтверждаемое разделение помечено `INSUFFICIENT_DATA`.
 
-## Локальный запуск текущего этапа
+## Запуск текущего этапа
 
-Текущий baseline рассчитан на macOS с Apple Vision. Используется Python из рабочего runtime, `openpyxl 3.1.5` и `python-docx 1.2.0`.
+Linux OCR отчета воспроизводится в Docker и не обращается к внешним API:
+
+```bash
+docker compose build report-ocr
+docker compose run --rm report-ocr
+docker compose run --rm ocr-benchmark
+```
+
+Полная текущая сверка использует подготовленный реестр первичных документов и автоматически выбирает Linux OCR отчета, если он создан:
 
 ```bash
 bash scripts/download_case19.sh
 bash scripts/run_case19_registry.sh
+bash scripts/run_case19_linux_ocr.sh
 bash scripts/run_case19_reconciliation.sh
 PYTHONPATH=src python3 -m unittest discover -v tests
 ```
+
+Подробные результаты и ограничения: [Linux OCR и Docker](docs/financial-report-verification-plan/linux-ocr-docker-results.md).
 
 Результаты создаются в `artifacts/case19-registry/results`:
 

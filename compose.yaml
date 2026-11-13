@@ -1,4 +1,26 @@
 services:
+  report-ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile.ocr
+    image: mipt-financial-reportings-ocr:local
+    entrypoint: ["python", "-m", "financial_verification.report_ocr_pipeline"]
+    environment:
+      PADDLE_DEVICE: cpu
+      PADDLE_CPU_THREADS: "2"
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+    volumes:
+      - ./data:/workspace/data:ro
+      - ./artifacts:/workspace/artifacts
+      - ./config:/workspace/config:ro
+    command:
+      - --input-pdf
+      - /workspace/data/case-19/01_kfz_stage_3.pdf
+      - --context
+      - /workspace/config/case19-verification-context.json
+      - --output-dir
+      - /workspace/artifacts/linux-report-ocr
+
   ocr-benchmark:
     build:
       context: .

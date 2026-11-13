@@ -689,6 +689,8 @@ def run(
 
     operations = build_operations(registry, input_dir, ocr_dir, rules)
     report_fields = extract_report_row(report_ocr_path, context["report_row_fields"])
+    report_ocr_payload = json.loads(report_ocr_path.read_text(encoding="utf-8"))
+    report_provider = report_ocr_payload.get("provider", "unknown")
     result = reconcile(operations, report_fields, context, rules)
     return {
         "case_id": context["case_id"],
@@ -697,7 +699,8 @@ def run(
         "oracle_used_by_working_pipeline": False,
         "registry_summary": registry["summary"],
         "report_extraction": {
-            "method": "region_first_apple_vision_ocr",
+            "method": f"region_first_{report_provider}",
+            "provider": report_provider,
             "source": str(report_ocr_path),
             "fields": report_fields,
         },

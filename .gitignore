@@ -1,6 +1,8 @@
 /artifacts/kfz-row-extraction/
 /artifacts/case19-registry/
 /artifacts/case19-reconciliation/
+/artifacts/linux-ocr-*/
+/artifacts/linux-report-ocr*/
 /data/case-19/
 /poc/kfz-row-extraction/__pycache__/
 *.pyc

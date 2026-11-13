@@ -1,4 +1,4 @@
-FROM python:3.11-slim-bookworm
+FROM python:3.11-slim@sha256:07d4824036af339fa1b6ef769cc99d9c10a141769538b52b3b597c84f7a7b535
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -24,9 +24,9 @@ COPY requirements.ocr.txt /app/requirements.ocr.txt
 RUN python -m pip install --no-cache-dir --upgrade pip==26.3 \
     && python -m pip install --no-cache-dir -r /app/requirements.ocr.txt
 
+RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(text_detection_model_name='PP-OCRv5_mobile_det', text_recognition_model_name='eslav_PP-OCRv5_mobile_rec', use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False, enable_mkldnn=False, cpu_threads=2, device='cpu')"
+
 COPY src /app/src
 COPY poc/linux-ocr-benchmark /app/poc/linux-ocr-benchmark
-
-RUN python -m financial_verification.ocr --provider paddle --warmup
 
 ENTRYPOINT ["python", "/app/poc/linux-ocr-benchmark/run_benchmark.py"]

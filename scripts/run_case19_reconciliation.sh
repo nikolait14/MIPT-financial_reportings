@@ -5,7 +5,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PYTHON_BIN="/Users/data/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
 REGISTRY="$PROJECT_DIR/artifacts/case19-registry/results/document-registry.json"
-REPORT_OCR="$PROJECT_DIR/artifacts/kfz-row-extraction/300dpi/region-run-1.json"
+LINUX_REPORT_OCR="$PROJECT_DIR/artifacts/linux-report-ocr/report-ocr.json"
+APPLE_REPORT_OCR="$PROJECT_DIR/artifacts/kfz-row-extraction/300dpi/region-run-1.json"
+REPORT_OCR="${REPORT_OCR:-$LINUX_REPORT_OCR}"
+
+if [[ ! -f "$REPORT_OCR" && -f "$APPLE_REPORT_OCR" ]]; then
+  REPORT_OCR="$APPLE_REPORT_OCR"
+fi
 
 if [[ ! -f "$REGISTRY" ]]; then
   echo "Missing registry: run scripts/run_case19_registry.sh first" >&2
@@ -13,7 +19,7 @@ if [[ ! -f "$REGISTRY" ]]; then
 fi
 
 if [[ ! -f "$REPORT_OCR" ]]; then
-  echo "Missing report OCR: run poc/kfz-row-extraction/run_local_baseline.sh first" >&2
+  echo "Missing report OCR: run scripts/run_case19_linux_ocr.sh first" >&2
   exit 2
 fi
 

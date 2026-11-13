@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import statistics
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +40,56 @@ def find_anchor(observations: list[dict], target_label: str) -> dict:
         has_number = not target_stage or value.lstrip().startswith(target_stage.group(1))
         if has_year and has_stage and has_number:
             candidates.append(observation)
+    if not candidates:
+        # Tesseract commonly emits a table-row label as separate words. Rebuild
+        # visual lines before matching; this is based only on geometry and the
+        # requested label, never on expected monetary values.
+        heights = [item["bboxPixels"][3] for item in observations if item["bboxPixels"][3] > 0]
+        tolerance = max(8.0, (statistics.median(heights) if heights else 10.0) * 0.8)
+        lines: list[list[dict]] = []
+        for observation in sorted(
+            observations,
+            key=lambda item: (
+                item["bboxPixels"][1] + item["bboxPixels"][3] / 2,
+                item["bboxPixels"][0],
+            ),
+        ):
+            _, top, _, height = observation["bboxPixels"]
+            center_y = top + height / 2
+            for line in lines:
+                line_centers = [
+                    item["bboxPixels"][1] + item["bboxPixels"][3] / 2 for item in line
+                ]
+                if abs(center_y - statistics.median(line_centers)) <= tolerance:
+                    line.append(observation)
+                    break
+            else:
+                lines.append([observation])
+        for line in lines:
+            line.sort(key=lambda item: item["bboxPixels"][0])
+            value = normalized_label(" ".join(item["text"] for item in line))
+            has_year = not target_years or target_years[0] in value
+            has_stage = "этап" in value
+            has_number = not target_stage or bool(
+                re.search(rf"(?:^|\s){re.escape(target_stage.group(1))}\s*этап", value)
+            )
+            if not (has_year and has_stage and has_number):
+                continue
+            left = min(item["bboxPixels"][0] for item in line)
+            top = min(item["bboxPixels"][1] for item in line)
+            right = max(item["bboxPixels"][0] + item["bboxPixels"][2] for item in line)
+            bottom = max(item["bboxPixels"][1] + item["bboxPixels"][3] for item in line)
+            confidence = min(float(item.get("confidence", 0.0)) for item in line)
+            candidates.append(
+                {
+                    "text": " ".join(item["text"] for item in line),
+                    "confidence": confidence,
+                    "bboxPixels": [left, top, right - left, bottom - top],
+                    "bboxNormalized": [],
+                    "alternatives": [],
+                    "composedFrom": len(line),
+                }
+            )
     if not candidates:
         raise RuntimeError(f"Target row label was not found: {target_label!r}")
     candidates.sort(key=lambda item: item["bboxPixels"][1])

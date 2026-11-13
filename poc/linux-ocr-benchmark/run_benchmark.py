@@ -94,9 +94,11 @@ def evaluate(regions: dict, ocr: dict, gold: dict[str, str], bbox_key: str) -> d
     }
 
 
-def recognize(provider: OCRProvider, image: Path, output: Path) -> tuple[dict, float]:
+def recognize(
+    provider: OCRProvider, image: Path, output: Path, *, numeric: bool = False
+) -> tuple[dict, float]:
     started = time.perf_counter()
-    result = provider.recognize(image)
+    result = provider.recognize(image, numeric=numeric)
     duration = time.perf_counter() - started
     write_result(result, output)
     return asdict(result), duration
@@ -160,6 +162,7 @@ def benchmark_provider(
                     provider,
                     contact_sheet,
                     dpi_dir / f"region-run-{run_number}.json",
+                    numeric=True,
                 )
                 full_evaluation = evaluate(
                     regions, full_payloads[run_number - 1][0], gold, "bbox"
@@ -179,6 +182,42 @@ def benchmark_provider(
         except Exception as error:  # noqa: BLE001 - one provider/DPI must not stop the matrix
             dpi_result["preparation_status"] = "FAIL"
             dpi_result["error"] = f"{type(error).__name__}: {error}"
+            reference_dir = args.output_dir / "paddle" / f"{dpi}dpi"
+            reference_regions = reference_dir / "regions.json"
+            reference_sheet = reference_dir / "cells-contact-sheet.png"
+            if (
+                provider_name != "paddle"
+                and full_payloads
+                and reference_regions.exists()
+                and reference_sheet.exists()
+            ):
+                regions = json.loads(reference_regions.read_text(encoding="utf-8"))
+                dpi_result["region_source"] = "paddle_preprocessing"
+                for run_number in range(1, args.repeats + 1):
+                    region_payload, region_duration = recognize(
+                        provider,
+                        reference_sheet,
+                        dpi_dir / f"region-run-{run_number}.json",
+                        numeric=True,
+                    )
+                    run_result = {
+                        "run": run_number,
+                        "full_page_duration_seconds": round(
+                            full_payloads[run_number - 1][1], 4
+                        ),
+                        "region_duration_seconds": round(region_duration, 4),
+                        "full_page": evaluate(
+                            regions, full_payloads[run_number - 1][0], gold, "bbox"
+                        ),
+                        "region_first": evaluate(
+                            regions, region_payload, gold, "slot_bbox"
+                        ),
+                    }
+                    dpi_result["runs"].append(run_result)
+                    (dpi_dir / f"evaluation-run-{run_number}.json").write_text(
+                        json.dumps(run_result, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
 
         dpi_result["region_pass_runs"] = sum(
             run["region_first"]["status"] == "PASS" for run in dpi_result["runs"]
@@ -194,31 +233,63 @@ def benchmark_provider(
             dpi_result["preparation_status"] == "PASS"
             and dpi_result["region_pass_runs"] == args.repeats
         )
+        dpi_result["fallback_qualified"] = (
+            dpi_result["preparation_status"] == "PASS"
+            and (
+                dpi_result["region_pass_runs"] == args.repeats
+                or dpi_result["full_page_pass_runs"] == args.repeats
+            )
+        )
+        if dpi_result["fallback_qualified"]:
+            dpi_result["fallback_strategy"] = (
+                "region_first"
+                if dpi_result["region_pass_runs"] == args.repeats
+                else "full_page"
+            )
         provider_result["dpis"][str(dpi)] = dpi_result
     return provider_result
 
 
 def select_providers(results: list[dict], repeats: int) -> dict:
-    candidates = []
+    primary_candidates = []
+    fallback_candidates = []
     for result in results:
         for dpi, dpi_result in result["dpis"].items():
+            candidate = {
+                "provider_key": result["provider_key"],
+                "provider": result["provider"],
+                "dpi": int(dpi),
+                "median_region_seconds": dpi_result["median_region_seconds"],
+                "preparation_status": dpi_result["preparation_status"],
+                "strategy": dpi_result.get("fallback_strategy", "region_first"),
+            }
             if dpi_result["qualified"]:
-                candidates.append(
-                    {
-                        "provider_key": result["provider_key"],
-                        "provider": result["provider"],
-                        "dpi": int(dpi),
-                        "median_region_seconds": dpi_result["median_region_seconds"],
-                    }
-                )
-    candidates.sort(
+                primary_candidates.append(candidate)
+            if dpi_result["fallback_qualified"]:
+                fallback_candidates.append(candidate)
+    primary_candidates.sort(
         key=lambda item: (item["dpi"], item["median_region_seconds"], item["provider_key"])
     )
+    primary = primary_candidates[0] if primary_candidates else None
+    fallback_candidates.sort(
+        key=lambda item: (item["dpi"], item["median_region_seconds"], item["provider_key"])
+    )
+    fallbacks = []
+    seen_providers = {primary["provider_key"]} if primary else set()
+    for candidate in fallback_candidates:
+        if candidate["provider_key"] in seen_providers:
+            continue
+        fallbacks.append(candidate)
+        seen_providers.add(candidate["provider_key"])
     return {
-        "status": "PASS" if candidates else "FAIL",
-        "primary": candidates[0] if candidates else None,
-        "fallbacks": candidates[1:] if len(candidates) > 1 else [],
-        "qualification_rule": f"region-first 15/15 in {repeats}/{repeats} runs and row preparation PASS",
+        "status": "PASS" if primary else "FAIL",
+        "primary": primary,
+        "fallbacks": fallbacks,
+        "qualification_rule": (
+            f"primary: row preparation PASS and region-first 15/15 in {repeats}/{repeats} runs; "
+            f"fallback: row preparation PASS and either full-page or region-first 15/15 "
+            f"in {repeats}/{repeats} runs"
+        ),
     }
 
 
@@ -230,8 +301,8 @@ def write_markdown(payload: dict, path: Path) -> None:
         f"- Rule: {payload['selection']['qualification_rule']}.",
         f"- Primary: `{payload['selection']['primary']}`.",
         "",
-        "| Provider | DPI | Preparation | Full-page passes | Region-first passes | Median region time | Qualified |",
-        "|---|---:|---|---:|---:|---:|---|",
+        "| Provider | DPI | Preparation | Full-page passes | Region-first passes | Median region time | Primary | Fallback | Strategy |",
+        "|---|---:|---|---:|---:|---:|---|---|---|",
     ]
     for provider in payload["providers"]:
         for dpi, result in provider["dpis"].items():
@@ -239,7 +310,8 @@ def write_markdown(payload: dict, path: Path) -> None:
                 f"| {provider['provider']} | {dpi} | {result['preparation_status']} | "
                 f"{result['full_page_pass_runs']}/{payload['repeats']} | "
                 f"{result['region_pass_runs']}/{payload['repeats']} | "
-                f"{result['median_region_seconds'] or '—'} | {result['qualified']} |"
+                f"{result['median_region_seconds'] or '—'} | {result['qualified']} | "
+                f"{result['fallback_qualified']} | {result.get('fallback_strategy', '—')} |"
             )
             if result.get("error"):
                 lines.append(f"\nError `{provider['provider']}` {dpi} DPI: `{result['error']}`.\n")

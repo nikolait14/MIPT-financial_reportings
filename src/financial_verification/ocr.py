@@ -44,7 +44,7 @@ class OCRResult:
 class OCRProvider(Protocol):
     name: str
 
-    def recognize(self, image_path: Path) -> OCRResult: ...
+    def recognize(self, image_path: Path, *, numeric: bool = False) -> OCRResult: ...
 
 
 def normalized_bbox(left: int, top: int, width: int, height: int, image_width: int, image_height: int) -> list[float]:
@@ -63,7 +63,7 @@ class TesseractOCRProvider:
     def __init__(self, page_segmentation_mode: int = 11) -> None:
         self.page_segmentation_mode = page_segmentation_mode
 
-    def recognize(self, image_path: Path) -> OCRResult:
+    def recognize(self, image_path: Path, *, numeric: bool = False) -> OCRResult:
         with Image.open(image_path) as image:
             image_width, image_height = image.size
         command = [
@@ -76,8 +76,15 @@ class TesseractOCRProvider:
             "1",
             "--psm",
             str(self.page_segmentation_mode),
-            "tsv",
         ]
+        if numeric:
+            command.extend(
+                [
+                    "-c",
+                    "tessedit_char_whitelist=0123456789.,-",
+                ]
+            )
+        command.append("tsv")
         completed = subprocess.run(
             command,
             check=True,
@@ -149,7 +156,7 @@ class PaddleOCRProvider:
             raise TypeError(f"Unsupported PaddleOCR result type: {type(value)!r}")
         return value.get("res", value)
 
-    def recognize(self, image_path: Path) -> OCRResult:
+    def recognize(self, image_path: Path, *, numeric: bool = False) -> OCRResult:
         with Image.open(image_path) as image:
             image_width, image_height = image.size
         observations = []
@@ -218,6 +225,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--warmup", action="store_true")
+    parser.add_argument("--numeric", action="store_true")
     return parser.parse_args()
 
 
@@ -229,7 +237,7 @@ def main() -> int:
         return 0
     if not args.image or not args.output:
         raise SystemExit("--image and --output are required unless --warmup is used")
-    result = provider.recognize(args.image)
+    result = provider.recognize(args.image, numeric=args.numeric)
     write_result(result, args.output)
     print(
         json.dumps(

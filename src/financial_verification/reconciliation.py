@@ -336,12 +336,22 @@ def extract_report_row(report_ocr_path: Path, field_order: list[str]) -> dict[st
         raw = " ".join(item[1]["text"] for item in matches)
         if not raw:
             raise ReconciliationError(f"Report cell {index} ({field_id}) has no OCR value")
+        cleaned_from = None
         try:
             value = parse_decimal(raw)
         except InvalidOperation as error:
-            raise ReconciliationError(
-                f"Report cell {index} ({field_id}) is not numeric: {raw!r}"
-            ) from error
+            # Only separator-like noise between digit groups (dashes, underscores,
+            # quotes) is dropped, e.g. "5 054 ——— 470,26". Letters are never
+            # touched, so "1O0" still fails. The original text stays in evidence
+            # and the internal-arithmetic check below rejects a wrong guess.
+            cleaned = re.sub(r"(?<=\d)[\s\u2010-\u2015_\-'\"~]+(?=\d)", " ", raw).strip()
+            try:
+                value = parse_decimal(cleaned)
+            except InvalidOperation:
+                raise ReconciliationError(
+                    f"Report cell {index} ({field_id}) is not numeric: {raw!r}"
+                ) from error
+            cleaned_from = raw
         fields[field_id] = {
             "field_id": field_id,
             "field_name": FIELD_LABELS.get(field_id, field_id),
@@ -350,6 +360,7 @@ def extract_report_row(report_ocr_path: Path, field_order: list[str]) -> dict[st
                 "source": str(report_ocr_path),
                 "locator": f"contact_sheet_slot:{index}",
                 "raw": raw,
+                "ocr_cleaned_from": cleaned_from,
                 "observations": [
                     {
                         "bbox": item[1]["bboxPixels"],
@@ -359,7 +370,32 @@ def extract_report_row(report_ocr_path: Path, field_order: list[str]) -> dict[st
                 ],
             },
         }
+    _check_cleaned_cells(fields)
     return fields
+
+
+def _check_cleaned_cells(fields: dict[str, Any]) -> None:
+    """A cell repaired from OCR noise must agree with the report's own arithmetic."""
+    if not any(item.get("ocr_cleaned_from") for item in fields.values()):
+        return
+    relations = [
+        ("wages_without_reserve", ["base_wages", "additional_wages"]),
+        ("wages_total", ["wages_without_reserve", "leave_reserve"]),
+        ("insurance_without_reserve", ["insurance_base_wages", "insurance_additional_wages"]),
+        ("insurance_total", ["insurance_without_reserve", "insurance_leave_reserve"]),
+    ]
+    for total_id, part_ids in relations:
+        involved = [total_id, *part_ids]
+        if not all(f in fields for f in involved):
+            continue
+        if not any(fields[f].get("ocr_cleaned_from") for f in involved):
+            continue
+        total = Decimal(fields[total_id]["value"])
+        parts = sum((Decimal(fields[f]["value"]) for f in part_ids), Decimal("0"))
+        if total != parts:
+            raise ReconciliationError(
+                f"OCR-repaired cell breaks report arithmetic: {total_id}={total} != {parts}"
+            )
 
 
 def comparison_status(report_value: Decimal, supported_value: Decimal) -> tuple[str, str, str]:

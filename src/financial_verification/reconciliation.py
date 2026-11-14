@@ -69,7 +69,7 @@ class Operation:
     contract_number: str | None
     period_from: str | None
     period_to: str | None
-    amount: str
+    amount: str | None
     currency: str
     amount_evidence: dict[str, Any] | None
     classification: ClassificationResult
@@ -100,9 +100,11 @@ def decimal_string(value: Decimal) -> str:
 
 def parse_decimal(raw: str) -> Decimal:
     value = raw.strip().replace("\u00a0", " ")
-    value = re.sub(r"[^0-9,.-]", "", value.replace(" ", ""))
-    if not value:
-        raise InvalidOperation(f"No number in {raw!r}")
+    if not value or re.search(r"[^0-9\s,\.\-+]", value):
+        raise InvalidOperation(f"Invalid characters in number {raw!r}")
+    value = re.sub(r"\s+", "", value)
+    if not re.fullmatch(r"[+-]?\d+(?:[.,]\d+)*", value):
+        raise InvalidOperation(f"Invalid number format {raw!r}")
     if "," in value and "." in value:
         if value.rfind(",") > value.rfind("."):
             value = value.replace(".", "").replace(",", ".")
@@ -243,7 +245,38 @@ def build_operations(
 ) -> list[Operation]:
     operations = []
     for record in registry["records"]:
-        if record["role"] != "SOURCE_DOCUMENT" or record["decision"] != "INCLUDE":
+        if record["role"] != "SOURCE_DOCUMENT":
+            continue
+        if record["decision"] == "REVIEW":
+            operations.append(
+                Operation(
+                    operation_id=f"{record['document_id']}:review",
+                    document_id=record["document_id"],
+                    file_name=record["file_name"],
+                    document_number=record["document_number"],
+                    contract_number=record["contract_number"],
+                    period_from=record["period_from"],
+                    period_to=record["period_to"],
+                    amount=record["amount"],
+                    currency="RUB",
+                    amount_evidence=record["evidence"].get("amount"),
+                    classification=ClassificationResult(
+                        status="REVIEW",
+                        reason_code=record["reason_code"],
+                        article_code=None,
+                        article_name=None,
+                        confidence=None,
+                        rule_set_version=rules["version"],
+                        score=0,
+                        score_margin=0,
+                        scores={},
+                    ),
+                    normalization_status=record["processing_status"],
+                    warnings=record["warnings"],
+                )
+            )
+            continue
+        if record["decision"] != "INCLUDE":
             continue
         if record["amount"] is None:
             raise ReconciliationError(f"Included document has no amount: {record['file_name']}")
@@ -356,25 +389,50 @@ def reconcile(
 ) -> dict[str, Any]:
     classified = [op for op in operations if op.classification.status == "CLASSIFIED"]
     review = [op for op in operations if op.classification.status != "CLASSIFIED"]
+    technical_review = any(
+        op.classification.reason_code
+        in {"EXTRACTION_FAILED", "EXTRACTION_INCOMPLETE", "NORMALIZATION_FAILED"}
+        for op in review
+    )
+    review_reason = (
+        "SOURCE_DOCUMENT_PROCESSING_INCOMPLETE"
+        if technical_review
+        else "UNCLASSIFIED_OPERATIONS_PRESENT"
+    )
     article_results = []
 
     for article_code, report_field_id in context["article_report_fields"].items():
         sources = [op for op in classified if op.classification.article_code == article_code]
-        supported = sum((Decimal(op.amount) for op in sources), Decimal("0"))
+        supported = sum((Decimal(op.amount) for op in sources if op.amount is not None), Decimal("0"))
         report_value = Decimal(report_fields[report_field_id]["value"])
-        status, reason_code, direction = comparison_status(report_value, supported)
-        if review:
+        if not sources:
             status = "INSUFFICIENT_DATA"
-            reason_code = "UNCLASSIFIED_OPERATIONS_PRESENT"
+            reason_code = "MISSING_DOCUMENT"
             direction = "UNKNOWN"
+            supported_value = None
+            delta = None
+            supported_value_is_partial = False
+        elif review:
+            status = "INSUFFICIENT_DATA"
+            reason_code = review_reason
+            direction = "UNKNOWN"
+            supported_value = decimal_string(supported)
+            delta = None
+            supported_value_is_partial = True
+        else:
+            status, reason_code, direction = comparison_status(report_value, supported)
+            supported_value = decimal_string(supported)
+            delta = decimal_string(report_value - supported)
+            supported_value_is_partial = False
         article_results.append(
             {
                 "article_code": article_code,
                 "article_name": rules["articles"][article_code]["name"],
                 "report_field_id": report_field_id,
                 "report_value": decimal_string(report_value),
-                "supported_value": decimal_string(supported),
-                "delta_report_minus_supported": decimal_string(report_value - supported),
+                "supported_value": supported_value,
+                "supported_value_is_partial": supported_value_is_partial,
+                "delta_report_minus_supported": delta,
                 "status": status,
                 "reason_code": reason_code,
                 "direction": direction,
@@ -393,26 +451,76 @@ def reconcile(
                     for op in sources
                 ],
                 "report_evidence": report_fields[report_field_id]["evidence"],
-                "formula": " + ".join(op.amount for op in sources) or "0.00",
+                "formula": " + ".join(op.amount for op in sources if op.amount is not None) or None,
             }
         )
 
-    total_supported = sum((Decimal(op.amount) for op in operations), Decimal("0"))
+    total_supported = sum(
+        (Decimal(op.amount) for op in classified if op.amount is not None), Decimal("0")
+    )
     total_field_id = context["total_report_field"]
     total_report = Decimal(report_fields[total_field_id]["value"])
-    total_status, total_reason, total_direction = comparison_status(total_report, total_supported)
+    missing_article_sources = any(item["source_count"] == 0 for item in article_results)
+    if review:
+        total_status = "INSUFFICIENT_DATA"
+        total_reason = review_reason
+        total_direction = "UNKNOWN"
+        total_value = decimal_string(total_supported) if classified else None
+        total_delta = None
+        total_is_partial = True
+    elif missing_article_sources:
+        total_status = "INSUFFICIENT_DATA"
+        total_reason = "MISSING_DOCUMENT"
+        total_direction = "UNKNOWN"
+        total_value = decimal_string(total_supported) if classified else None
+        total_delta = None
+        total_is_partial = bool(classified)
+    else:
+        total_status, total_reason, total_direction = comparison_status(
+            total_report, total_supported
+        )
+        total_value = decimal_string(total_supported)
+        total_delta = decimal_string(total_report - total_supported)
+        total_is_partial = False
     total_result = {
         "report_field_id": total_field_id,
         "report_value": decimal_string(total_report),
-        "supported_value": decimal_string(total_supported),
-        "delta_report_minus_supported": decimal_string(total_report - total_supported),
+        "supported_value": total_value,
+        "supported_value_is_partial": total_is_partial,
+        "delta_report_minus_supported": total_delta,
         "status": total_status,
         "reason_code": total_reason,
         "direction": total_direction,
-        "source_count": len(operations),
-        "source_operation_ids": [op.operation_id for op in operations],
+        "source_count": len(classified),
+        "source_operation_ids": [op.operation_id for op in classified],
+        "unclassified_operation_ids": [op.operation_id for op in review],
         "report_evidence": report_fields[total_field_id]["evidence"],
-        "formula": " + ".join(op.amount for op in operations),
+        "formula": " + ".join(
+            op.amount for op in classified if op.amount is not None
+        )
+        or None,
+    }
+
+    report_article_sum = sum(
+        (
+            Decimal(report_fields[field_id]["value"])
+            for field_id in context["article_report_fields"].values()
+        ),
+        Decimal("0"),
+    )
+    report_consistency_delta = total_report - report_article_sum
+    report_consistency = {
+        "article_field_ids": list(context["article_report_fields"].values()),
+        "total_field_id": total_field_id,
+        "article_sum": decimal_string(report_article_sum),
+        "row_total": decimal_string(total_report),
+        "delta_row_total_minus_article_sum": decimal_string(report_consistency_delta),
+        "status": "CORRECT" if report_consistency_delta == 0 else "MISMATCH",
+        "reason_code": (
+            "REPORT_TOTAL_CONSISTENT"
+            if report_consistency_delta == 0
+            else "REPORT_TOTAL_INCONSISTENT"
+        ),
     }
 
     verified_details = []
@@ -425,7 +533,7 @@ def reconcile(
                 "file_name": operation.file_name,
                 **line_item,
             }
-            for operation in operations
+            for operation in classified
             for line_item in operation.line_items
             if line_item["code"] in code_set
         ]
@@ -436,7 +544,25 @@ def reconcile(
             (Decimal(report_fields[field_id]["value"]) for field_id in check["report_field_ids"]),
             Decimal("0"),
         )
-        status, reason_code, direction = comparison_status(report_value, supported)
+        if not source_items:
+            status = "INSUFFICIENT_DATA"
+            reason_code = "MISSING_DETAIL_SOURCE"
+            direction = "UNKNOWN"
+            supported_value = None
+            delta = None
+            supported_value_is_partial = False
+        elif review:
+            status = "INSUFFICIENT_DATA"
+            reason_code = review_reason
+            direction = "UNKNOWN"
+            supported_value = decimal_string(supported)
+            delta = None
+            supported_value_is_partial = True
+        else:
+            status, reason_code, direction = comparison_status(report_value, supported)
+            supported_value = decimal_string(supported)
+            delta = decimal_string(report_value - supported)
+            supported_value_is_partial = False
         verified_details.append(
             {
                 "check_id": check["check_id"],
@@ -444,8 +570,9 @@ def reconcile(
                 "source_line_item_codes": check["source_line_item_codes"],
                 "report_field_ids": check["report_field_ids"],
                 "report_value": decimal_string(report_value),
-                "supported_value": decimal_string(supported),
-                "delta_report_minus_supported": decimal_string(report_value - supported),
+                "supported_value": supported_value,
+                "supported_value_is_partial": supported_value_is_partial,
+                "delta_report_minus_supported": delta,
                 "status": status,
                 "reason_code": reason_code,
                 "direction": direction,
@@ -455,7 +582,7 @@ def reconcile(
                     report_fields[field_id]["evidence"]
                     for field_id in check["report_field_ids"]
                 ],
-                "formula": " + ".join(item["amount"] for item in source_items) or "0.00",
+                "formula": " + ".join(item["amount"] for item in source_items) or None,
             }
         )
 
@@ -475,9 +602,18 @@ def reconcile(
 
     mismatches = [item for item in article_results if item["status"] == "MISMATCH"]
     detail_mismatches = [item for item in verified_details if item["status"] == "MISMATCH"]
-    if review:
+    insufficient_articles = [
+        item for item in article_results if item["status"] == "INSUFFICIENT_DATA"
+    ]
+    if report_consistency["status"] == "MISMATCH":
+        conclusion_status = "REPORT_UNRELIABLE"
+        conclusion_reason = "REPORT_TOTAL_INCONSISTENT"
+    elif review:
         conclusion_status = "INSUFFICIENT_DATA"
-        conclusion_reason = "UNCLASSIFIED_OPERATIONS_PRESENT"
+        conclusion_reason = review_reason
+    elif insufficient_articles:
+        conclusion_status = "INSUFFICIENT_DATA"
+        conclusion_reason = "MISSING_DOCUMENT"
     elif mismatches or detail_mismatches or total_status == "MISMATCH":
         conclusion_status = "REPORT_UNRELIABLE"
         conclusion_reason = "CONFIRMED_FINANCIAL_DISCREPANCY"
@@ -488,6 +624,7 @@ def reconcile(
     return {
         "articles": article_results,
         "total": total_result,
+        "report_consistency": report_consistency,
         "verified_details": verified_details,
         "unverified_details": detail_results,
         "conclusion": {
@@ -496,8 +633,9 @@ def reconcile(
             "classified_operations": len(classified),
             "review_operations": len(review),
             "article_mismatches": len(mismatches),
+            "insufficient_articles": len(insufficient_articles),
             "detail_mismatches": len(detail_mismatches),
-            "checked_articles": len(article_results),
+            "checked_articles": len(article_results) - len(insufficient_articles),
             "unverified_detail_fields": len(detail_results),
         },
     }
@@ -522,6 +660,14 @@ def source_exclusions(registry: dict[str, Any]) -> list[dict[str, Any]]:
 
 def markdown_report(payload: dict[str, Any]) -> str:
     result = payload["reconciliation"]
+
+    def shown(value: Any) -> str:
+        return "—" if value is None else str(value)
+
+    def shown_supported(item: dict[str, Any]) -> str:
+        value = shown(item.get("supported_value"))
+        return f"{value} (частично)" if item.get("supported_value_is_partial") else value
+
     lines = [
         "# Сверка операций с КФЗ — кейс 19",
         "",
@@ -539,21 +685,41 @@ def markdown_report(payload: dict[str, Any]) -> str:
     for item in result["articles"]:
         lines.append(
             f"| {item['article_code']} — {item['article_name']} | {item['report_value']} | "
-            f"{item['supported_value']} | {item['delta_report_minus_supported']} | "
+            f"{shown_supported(item)} | {shown(item['delta_report_minus_supported'])} | "
             f"{item['status']} / {item['reason_code']} | {item['source_count']} |"
         )
     total = result["total"]
     lines.append(
-        f"| **Итого** | **{total['report_value']}** | **{total['supported_value']}** | "
-        f"**{total['delta_report_minus_supported']}** | **{total['status']} / "
+        f"| **Итого** | **{total['report_value']}** | **{shown_supported(total)}** | "
+        f"**{shown(total['delta_report_minus_supported'])}** | **{total['status']} / "
         f"{total['reason_code']}** | **{total['source_count']}** |"
+    )
+
+    consistency = result["report_consistency"]
+    lines.extend(
+        [
+            "",
+            "## Внутренняя арифметика отчета",
+            "",
+            "| Сумма статей | Итоговая строка | Дельта | Статус |",
+            "|---:|---:|---:|---|",
+            f"| {consistency['article_sum']} | {consistency['row_total']} | "
+            f"{consistency['delta_row_total_minus_article_sum']} | "
+            f"{consistency['status']} / {consistency['reason_code']} |",
+        ]
     )
 
     lines.extend(["", "## Цепочки доказательств", ""])
     for item in result["articles"]:
         lines.append(f"### {item['article_code']} — {item['article_name']}")
         lines.append("")
-        lines.append(f"Формула: `{item['formula']} = {item['supported_value']}`.")
+        if item["formula"]:
+            suffix = " (частичный итог)" if item["supported_value_is_partial"] else ""
+            lines.append(
+                f"Формула: `{item['formula']} = {item['supported_value']}`{suffix}."
+            )
+        else:
+            lines.append("Формула не строится: подтверждающие документы отсутствуют.")
         lines.append("")
         for source in item["sources"]:
             signal_ids = ", ".join(
@@ -579,6 +745,34 @@ def markdown_report(payload: dict[str, Any]) -> str:
             f"| {item['file_name']} | {item['reason_code']} | {item['amount'] or '—'} |"
         )
 
+    review_operations = [
+        operation
+        for operation in payload.get("operations", [])
+        if operation["classification"]["status"] != "CLASSIFIED"
+    ]
+    lines.extend(
+        [
+            "",
+            "## Операции на ручной или технической проверке",
+            "",
+        ]
+    )
+    if review_operations:
+        lines.extend(
+            [
+                "| Файл | Состояние | Причина | Предупреждения |",
+                "|---|---|---|---|",
+            ]
+        )
+        for operation in review_operations:
+            warnings = "; ".join(operation["warnings"]) or "—"
+            lines.append(
+                f"| {operation['file_name']} | {operation['normalization_status']} | "
+                f"{operation['classification']['reason_code']} | {warnings} |"
+            )
+    else:
+        lines.append("Таких операций нет.")
+
     lines.extend(
         [
             "",
@@ -590,8 +784,9 @@ def markdown_report(payload: dict[str, Any]) -> str:
     )
     for item in result["verified_details"]:
         lines.append(
-            f"| {item['check_name']} | {item['report_value']} | {item['supported_value']} | "
-            f"{item['delta_report_minus_supported']} | {item['status']} / {item['reason_code']} |"
+            f"| {item['check_name']} | {item['report_value']} | {shown_supported(item)} | "
+            f"{shown(item['delta_report_minus_supported'])} | {item['status']} / "
+            f"{item['reason_code']} |"
         )
 
     lines.extend(

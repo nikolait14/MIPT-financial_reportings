@@ -4,5 +4,6 @@
 /artifacts/linux-ocr-*/
 /artifacts/linux-report-ocr*/
 /data/case-19/
+/storage/
 /poc/kfz-row-extraction/__pycache__/
 *.pyc

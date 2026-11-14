@@ -8,6 +8,7 @@ import csv
 import hashlib
 import json
 import re
+import statistics
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import date
@@ -99,6 +100,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context", required=True, type=Path)
     parser.add_argument("--ocr-dir", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--fail-on-technical-errors", action="store_true")
     return parser.parse_args()
 
 
@@ -264,15 +266,62 @@ def extract_ocr(path: Path, ocr_dir: Path) -> ExtractedContent:
     if not ocr_path.exists():
         raise FileNotFoundError(f"OCR result not found: {ocr_path}")
     payload = json.loads(ocr_path.read_text(encoding="utf-8"))
-    observations = sorted(
-        payload["observations"], key=lambda item: (item["bboxPixels"][1], item["bboxPixels"][0])
-    )
-    lines = [item["text"].strip() for item in observations if item["text"].strip()]
-    evidence = [
-        Evidence(path.name, "page:1", item["text"].strip(), item["bboxPixels"])
-        for item in observations
-        if item["text"].strip()
+    source_hash = payload.get("sourceSha256")
+    if source_hash and source_hash != sha256_file(path):
+        raise ValueError(f"Stale OCR result for {path.name}: source SHA-256 changed")
+    observations = [
+        item for item in payload["observations"] if item.get("text", "").strip()
     ]
+    heights = [item["bboxPixels"][3] for item in observations if item["bboxPixels"][3] > 0]
+    tolerance = max(5.0, (statistics.median(heights) if heights else 10.0) * 0.6)
+    visual_lines: list[list[dict[str, Any]]] = []
+    for observation in sorted(
+        observations,
+        key=lambda item: (
+            item["bboxPixels"][1] + item["bboxPixels"][3] / 2,
+            item["bboxPixels"][0],
+        ),
+    ):
+        center_y = observation["bboxPixels"][1] + observation["bboxPixels"][3] / 2
+        matching_line = min(
+            visual_lines,
+            key=lambda line: abs(
+                center_y
+                - statistics.median(
+                    item["bboxPixels"][1] + item["bboxPixels"][3] / 2
+                    for item in line
+                )
+            ),
+            default=None,
+        )
+        if matching_line is not None:
+            line_center = statistics.median(
+                item["bboxPixels"][1] + item["bboxPixels"][3] / 2
+                for item in matching_line
+            )
+            if abs(center_y - line_center) <= tolerance:
+                matching_line.append(observation)
+                continue
+        visual_lines.append([observation])
+
+    visual_lines.sort(
+        key=lambda line: statistics.median(
+            item["bboxPixels"][1] + item["bboxPixels"][3] / 2 for item in line
+        )
+    )
+    lines = []
+    evidence = []
+    for line in visual_lines:
+        line.sort(key=lambda item: item["bboxPixels"][0])
+        text = " ".join(item["text"].strip() for item in line)
+        left = min(item["bboxPixels"][0] for item in line)
+        top = min(item["bboxPixels"][1] for item in line)
+        right = max(item["bboxPixels"][0] + item["bboxPixels"][2] for item in line)
+        bottom = max(item["bboxPixels"][1] + item["bboxPixels"][3] for item in line)
+        lines.append(text)
+        evidence.append(
+            Evidence(path.name, "page:1", text, [left, top, right - left, bottom - top])
+        )
     return ExtractedContent("\n".join(lines), lines, evidence)
 
 
@@ -360,7 +409,10 @@ def extract_content(path: Path, ocr_dir: Path) -> tuple[ExtractedContent, str]:
     if extension == ".xlsx":
         return extract_xlsx(path), "native_xlsx"
     if extension in {".pdf", ".png"}:
-        return extract_ocr(path, ocr_dir), "apple_vision_ocr"
+        ocr_path = ocr_dir / f"{path.stem}.json"
+        payload = json.loads(ocr_path.read_text(encoding="utf-8")) if ocr_path.exists() else {}
+        provider = payload.get("provider", "legacy")
+        return extract_ocr(path, ocr_dir), f"ocr:{provider}"
     if extension == ".txt":
         text = path.read_text(encoding="utf-8")
         lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -584,7 +636,9 @@ def main() -> int:
     write_outputs(records, context, args.output_dir)
     summary = json.loads((args.output_dir / "document-registry.json").read_text())["summary"]
     print(json.dumps(summary, ensure_ascii=False))
-    return 0 if summary["technical_errors"] == 0 else 1
+    if args.fail_on_technical_errors and summary["technical_errors"]:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

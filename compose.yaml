@@ -1,42 +1,141 @@
+x-runtime: &runtime
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: mipt-financial-reportings:local
+  environment:
+    PADDLE_DEVICE: cpu
+    PADDLE_CPU_THREADS: "2"
+    PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+  volumes:
+    - ${DATA_DIR:-./data}:/workspace/data:ro
+    - ${ARTIFACTS_DIR:-./artifacts}:/workspace/artifacts
+    - ${CONFIG_DIR:-./config}:/workspace/config:ro
+
 services:
-  report-ocr:
-    build:
-      context: .
-      dockerfile: Dockerfile.ocr
-    image: mipt-financial-reportings-ocr:local
-    entrypoint: ["python", "-m", "financial_verification.report_ocr_pipeline"]
+  api:
+    <<: *runtime
+    entrypoint: ["uvicorn"]
+    command:
+      - financial_verification.backend.api:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - "1"
     environment:
       PADDLE_DEVICE: cpu
       PADDLE_CPU_THREADS: "2"
       PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+      STORAGE_MODE: ${STORAGE_MODE:-ephemeral}
+      STORAGE_ROOT: /workspace/storage
+      CONFIG_DIR: /workspace/config
+      RESULT_TTL_SECONDS: ${RESULT_TTL_SECONDS:-1800}
+      RETENTION_DAYS: ${RETENTION_DAYS:-30}
+      MAX_FILES: ${MAX_FILES:-100}
+      MAX_FILE_SIZE_BYTES: ${MAX_FILE_SIZE_BYTES:-52428800}
+      MAX_TOTAL_SIZE_BYTES: ${MAX_TOTAL_SIZE_BYTES:-262144000}
+      JOB_WORKERS: "1"
+      PIPELINE_STAGE_TIMEOUT_SECONDS: ${PIPELINE_STAGE_TIMEOUT_SECONDS:-600}
+    ports:
+      - "${API_PORT:-8000}:8000"
     volumes:
-      - ./data:/workspace/data:ro
-      - ./artifacts:/workspace/artifacts
-      - ./config:/workspace/config:ro
+      - ${CONFIG_DIR:-./config}:/workspace/config:ro
+      - ${STORAGE_DIR:-./storage}:/workspace/storage
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready')"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  pipeline:
+    <<: *runtime
+    command:
+      - --input-dir
+      - /workspace/data/case-19/all
+      - --context
+      - /workspace/config/case19-verification-context.json
+      - --rules
+      - /workspace/config/cost-article-rules.json
+      - --artifacts-dir
+      - /workspace/artifacts
+
+  source-ocr:
+    <<: *runtime
+    entrypoint: ["python", "-m", "financial_verification.source_ocr_pipeline"]
+    command:
+      - --input-dir
+      - /workspace/data/case-19/all
+      - --context
+      - /workspace/config/case19-verification-context.json
+      - --output-dir
+      - /workspace/artifacts/case19-registry/ocr
+      - --provider
+      - tesseract
+
+  report-ocr:
+    <<: *runtime
+    entrypoint: ["python", "-m", "financial_verification.report_ocr_pipeline"]
     command:
       - --input-pdf
-      - /workspace/data/case-19/01_kfz_stage_3.pdf
+      - /workspace/data/case-19/all/01_Карточка_учета_фактических_затрат_этап_3.pdf
       - --context
       - /workspace/config/case19-verification-context.json
       - --output-dir
       - /workspace/artifacts/linux-report-ocr
 
-  ocr-benchmark:
-    build:
-      context: .
-      dockerfile: Dockerfile.ocr
-    image: mipt-financial-reportings-ocr:local
-    environment:
-      PADDLE_DEVICE: cpu
-      PADDLE_CPU_THREADS: "2"
-      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+  registry:
+    <<: *runtime
+    entrypoint: ["python", "-m", "financial_verification.document_registry"]
+    command:
+      - --input-dir
+      - /workspace/data/case-19/all
+      - --context
+      - /workspace/config/case19-verification-context.json
+      - --ocr-dir
+      - /workspace/artifacts/case19-registry/ocr
+      - --output-dir
+      - /workspace/artifacts/case19-registry/results
+
+  reconciliation:
+    <<: *runtime
+    entrypoint: ["python", "-m", "financial_verification.reconciliation"]
+    command:
+      - --registry
+      - /workspace/artifacts/case19-registry/results/document-registry.json
+      - --input-dir
+      - /workspace/data/case-19/all
+      - --ocr-dir
+      - /workspace/artifacts/case19-registry/ocr
+      - --context
+      - /workspace/config/case19-verification-context.json
+      - --rules
+      - /workspace/config/cost-article-rules.json
+      - --report-ocr
+      - /workspace/artifacts/linux-report-ocr/report-ocr.json
+      - --output-dir
+      - /workspace/artifacts/case19-reconciliation
+
+  tests:
+    <<: *runtime
+    entrypoint: ["python", "-m", "unittest", "discover", "-v", "tests"]
     volumes:
-      - ./data:/workspace/data:ro
-      - ./artifacts:/workspace/artifacts
-      - ./config:/workspace/config:ro
+      - ${DATA_DIR:-./data}:/app/data:ro
+      - ${ARTIFACTS_DIR:-./artifacts}:/app/artifacts:ro
+      - ${CONFIG_DIR:-./config}:/app/config:ro
+
+  ocr-benchmark:
+    <<: *runtime
+    entrypoint: ["python", "/app/poc/linux-ocr-benchmark/run_benchmark.py"]
     command:
       - --input-pdf
-      - /workspace/data/case-19/01_kfz_stage_3.pdf
+      - /workspace/data/case-19/all/01_Карточка_учета_фактических_затрат_этап_3.pdf
       - --context
       - /workspace/config/case19-verification-context.json
       - --gold

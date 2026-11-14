@@ -1,19 +1,104 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
 
 from financial_verification.document_registry import (
     build_base_records,
+    extract_ocr,
     mark_duplicates,
     process_records,
 )
+from financial_verification.source_ocr_pipeline import cached_result_is_current
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 RESULT_PATH = PROJECT_DIR / "artifacts/case19-registry/results/document-registry.json"
+
+
+class DocumentRegistryUnitTest(unittest.TestCase):
+    def test_ocr_words_are_grouped_into_visual_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.pdf"
+            source.write_bytes(b"synthetic source")
+            source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+            ocr_dir = root / "ocr"
+            ocr_dir.mkdir()
+            payload = {
+                "provider": "tesseract",
+                "sourceSha256": source_hash,
+                "renderDpi": 300,
+                "observations": [
+                    {"text": "Договор", "bboxPixels": [10, 10, 50, 12]},
+                    {"text": "24/03/15-01", "bboxPixels": [70, 11, 90, 12]},
+                    {"text": "Сумма", "bboxPixels": [10, 40, 40, 12]},
+                    {"text": "300 000,00", "bboxPixels": [60, 39, 85, 12]},
+                ],
+            }
+            ocr_path = ocr_dir / "source.json"
+            ocr_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            content = extract_ocr(source, ocr_dir)
+
+            self.assertEqual(
+                content.lines,
+                ["Договор 24/03/15-01", "Сумма 300 000,00"],
+            )
+
+    def test_ocr_cache_is_bound_to_source_hash_provider_and_dpi(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "result.json"
+            output.write_text(
+                json.dumps(
+                    {
+                        "sourceSha256": "current",
+                        "provider": "tesseract",
+                        "renderDpi": 300,
+                        "observations": [{"text": "ok"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertTrue(
+                cached_result_is_current(output, "current", "tesseract", 300)
+            )
+            self.assertFalse(
+                cached_result_is_current(output, "changed", "tesseract", 300)
+            )
+            self.assertFalse(
+                cached_result_is_current(output, "current", "paddle", 300)
+            )
+            self.assertFalse(
+                cached_result_is_current(output, "current", "tesseract", 400)
+            )
+
+    def test_stale_ocr_artifact_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.pdf"
+            source.write_bytes(b"new source")
+            ocr_dir = root / "ocr"
+            ocr_dir.mkdir()
+            (ocr_dir / "source.json").write_text(
+                json.dumps(
+                    {
+                        "sourceSha256": "old-hash",
+                        "observations": [
+                            {"text": "Сумма 1,00", "bboxPixels": [0, 0, 10, 10]}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "Stale OCR result"):
+                extract_ocr(source, ocr_dir)
 
 
 @unittest.skipUnless(RESULT_PATH.exists(), "Run scripts/run_case19_registry.sh first")

@@ -8,7 +8,7 @@ PoC рендерит первую страницу КФЗ в 300, 400 и 600 DPI
 
 ```bash
 bash poc/kfz-row-extraction/run_local_baseline.sh \
-  data/case-19/01_kfz_stage_3.pdf \
+  data/case-19/all/01_Карточка_учета_фактических_затрат_этап_3.pdf \
   artifacts/kfz-row-extraction
 ```
 

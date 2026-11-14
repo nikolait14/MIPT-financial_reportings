@@ -7,11 +7,13 @@
 - Production OCR не использует эталонные суммы, автоматически переключается на fallback и выдает совместимый со сверкой `report-ocr.json`.
 - Реализован `VerificationContext` для договора, периода, отчета и целевой строки.
 - Реализован реестр документов с SHA-256, уникальными идентификаторами и доказательствами извлечения.
-- DOCX и XLSX обрабатываются нативно; для отчета на Linux используется локальный PaddleOCR/Tesseract, Apple Vision сохранен как macOS-baseline для первичных PDF/PNG.
+- DOCX и XLSX обрабатываются нативно; первичные PDF/PNG — локальным Tesseract, отчет — локальным PaddleOCR с Tesseract fallback. Apple Vision сохранен только как исторический macOS-baseline.
 - Эталонный файл физически исключается из рабочего контура.
 - Реализованы `DUPLICATE_DOCUMENT`, `OUT_OF_PERIOD`, `WRONG_CONTRACT`, `EXTRACTION_INCOMPLETE` и изоляция ошибки отдельного файла.
 - Реализованы нормализация операций, доказательная классификация в `0200/0300/0800/0900`, точное агрегирование через `Decimal` и сверка с КФЗ.
 - Неоднозначная или неизвестная операция не классифицируется принудительно и получает `REVIEW`.
+- Отсутствующий источник не считается нулевой суммой: результат получает `INSUFFICIENT_DATA / MISSING_DOCUMENT`, а частичные суммы при `REVIEW` не образуют финансовую дельту.
+- OCR-числа разбираются строго; дополнительно проверяется равенство суммы статей итоговой строке КФЗ.
 - Для каждого результата сохраняются сумма, формула, исходные документы, фрагменты классификации и координаты или ячейки доказательств.
 
 На наборе кейса 19 получен ожидаемый результат:
@@ -27,27 +29,77 @@
 - итоговое заключение — `REPORT_UNRELIABLE`;
 - доступная внутренняя детализация зарплаты проверена, а неподтверждаемое разделение помечено `INSUFFICIENT_DATA`.
 
-## Запуск текущего этапа
+## Быстрый запуск всего решения
 
-Linux OCR отчета воспроизводится в Docker и не обращается к внешним API:
-
-```bash
-docker compose build report-ocr
-docker compose run --rm report-ocr
-docker compose run --rm ocr-benchmark
-```
-
-Полная текущая сверка использует подготовленный реестр первичных документов и автоматически выбирает Linux OCR отчета, если он создан:
+Требуются Docker Engine и Docker Compose v2. После загрузки набора полный сценарий запускается одной командой и не требует Python, OCR-библиотек или ручного изменения путей на хосте:
 
 ```bash
 bash scripts/download_case19.sh
-bash scripts/run_case19_registry.sh
-bash scripts/run_case19_linux_ocr.sh
-bash scripts/run_case19_reconciliation.sh
-PYTHONPATH=src python3 -m unittest discover -v tests
+bash scripts/run_case19_pipeline.sh
 ```
 
-Подробные результаты и ограничения: [Linux OCR и Docker](docs/financial-report-verification-plan/linux-ocr-docker-results.md).
+Эквивалентная команда без обертки:
+
+```bash
+docker compose run --rm --build pipeline
+```
+
+Контейнер последовательно выполняет OCR первичных PDF/PNG, OCR проверяемой строки отчета, построение реестра, фильтрацию, классификацию, сверку и генерацию итоговых файлов. Исходные документы монтируются read-only. Модели входят в образ, внешние API и сеть во время обработки не используются.
+
+Настраиваемые переменные окружения:
+
+| Переменная | Значение по умолчанию | Назначение |
+|---|---|---|
+| `DATA_DIR` | `./data` | Корень входных данных |
+| `ARTIFACTS_DIR` | `./artifacts` | Корень выходных артефактов и OCR-кэша |
+| `CONFIG_DIR` | `./config` | Контексты проверки и правила классификации |
+
+Например, запуск на копии данных с отдельным каталогом результатов:
+
+```bash
+DATA_DIR=/path/to/data ARTIFACTS_DIR=/path/to/artifacts \
+  docker compose run --rm --build pipeline
+```
+
+Повторный запуск использует OCR-кэш только при совпадении SHA-256 исходного файла, провайдера и DPI. Повреждение одного первичного документа не останавливает комплект: файл попадает в технический `REVIEW`, а итог становится `INSUFFICIENT_DATA`, а не ложным финансовым расхождением.
+
+Проверка тестов и остановка/очистка созданных Compose-контейнеров:
+
+```bash
+docker compose run --rm tests
+docker compose down --remove-orphans
+```
+
+Отдельные стадии доступны как сервисы `source-ocr`, `report-ocr`, `registry`, `reconciliation` и `ocr-benchmark`. Подробные результаты и ограничения: [Linux OCR и Docker](docs/financial-report-verification-plan/linux-ocr-docker-results.md).
+
+## Backend API
+
+Backend принимает комплект документов, запускает тот же проверенный pipeline и
+возвращает структурированный результат, evidence, annotations и информативный Markdown:
+
+```bash
+docker compose up --build api
+```
+
+- API: `http://localhost:8000/api/v1`
+- Swagger UI: `http://localhost:8000/docs`
+- readiness: `http://localhost:8000/health/ready`
+
+Текущий технический default — `EPHEMERAL`: документы находятся только во временном
+workspace и удаляются сразу после завершения обработки, а результат остается в RAM на
+30 минут. Для продуктового сценария выбран локальный PERSISTENT profile:
+
+```bash
+STORAGE_MODE=persistent RETENTION_DAYS=30 docker compose up --build api
+```
+
+`PERSISTENT` добавляет историю, восстановление после рестарта, повторный запуск без
+загрузки и ручное удаление. Следующая итерация развивает его в версионирование и
+сравнение документов по модели «Git для документов». Локальный режим не использует
+внешние API; публичное окружение потребует авторизации и изоляции пользователей.
+Подробный контракт и план:
+[Backend API, режимы хранения и доказательства](docs/financial-report-verification-plan/backend-api-storage-and-evidence.md).
+[Постоянное хранение и версионирование документов](docs/financial-report-verification-plan/persistent-document-versioning-plan.md).
 
 Результаты создаются в `artifacts/case19-registry/results`:
 
@@ -60,6 +112,13 @@ PYTHONPATH=src python3 -m unittest discover -v tests
 - `reconciliation.json` — полный результат с цепочками доказательств;
 - `operation-ledger.csv` — нормализованный реестр операций и решений классификатора;
 - `reconciliation.md` — человекочитаемое заключение, формулы и источники.
+
+Сводка выполнения всех стадий записывается в `artifacts/pipeline-summary.json`. `status: PASS` означает, что конвейер технически завершился; бизнес-заключение находится отдельно в `result.conclusion.status` и может быть `REPORT_UNRELIABLE` или `INSUFFICIENT_DATA`.
+
+### Типовые сценарии
+
+1. Полный комплект кейса 19: на входе исходная папка организаторов; на выходе `REPORT_UNRELIABLE`, подтвержденная сумма 11 567 877,40 руб. и завышение статьи `0800` и итога на 12 500,00 руб.
+2. Комплект с поврежденным первичным PDF: остальные документы продолжают обрабатываться; поврежденный файл перечисляется в отчете, финансовая дельта по неполному комплекту не утверждается, итог — `INSUFFICIENT_DATA / SOURCE_DOCUMENT_PROCESSING_INCOMPLETE`.
 
 Исходные документы и производные OCR-артефакты не включаются в Git.
 

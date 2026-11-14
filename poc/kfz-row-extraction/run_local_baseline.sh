@@ -9,8 +9,8 @@ fi
 INPUT_PDF="$1"
 OUTPUT_DIR="$2"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PYTHON_BIN="/Users/data/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
-PDFTOPPM_BIN="/Users/data/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/override/pdftoppm"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
+PDFTOPPM_BIN="${PDFTOPPM_BIN:-$(command -v pdftoppm)}"
 BUILD_DIR="$OUTPUT_DIR/build"
 MODULE_CACHE="$OUTPUT_DIR/module-cache"
 

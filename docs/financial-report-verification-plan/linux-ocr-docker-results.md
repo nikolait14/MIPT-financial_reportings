@@ -1,4 +1,4 @@
-# Linux OCR и Docker: решение и результаты
+# Linux OCR и полный Docker-конвейер: решение и результаты
 
 ## Принятое решение
 
@@ -31,26 +31,28 @@ Apple Vision сохраняется как macOS-baseline, но не входи�
 ## Production-поток
 
 ```text
-PDF отчета
-  → Poppler, страница 1 в 300 DPI
-  → PaddleOCR full page
-  → поиск подписи строки по этапу и году
-  → детерминированное определение границ таблицы
-  → контактный лист из 15 ячеек
-  → PaddleOCR числовых областей
-  → report-ocr.json + extraction.json + изображения доказательств
-  → существующая детерминированная сверка
+Папка комплекта
+  ├─ первичные PDF/PNG → Poppler/Tesseract → SHA-привязанный OCR-кэш
+  ├─ DOCX/XLSX → нативные парсеры
+  └─ PDF отчета → Poppler/PaddleOCR → поиск строки и 15 ячеек
+       ↓
+  реестр документов → фильтры дубля/периода/договора
+       ↓
+  классификация операций → Decimal-агрегирование → сверка
+       ↓
+  JSON + CSV + человекочитаемый Markdown + pipeline-summary.json
 ```
 
 Если основной провайдер не смог получить все 15 числовых полей, автоматически запускается Tesseract 400 DPI. Его full-page наблюдения проецируются в тот же контракт контактного листа, поэтому модуль сверки не зависит от OCR-движка.
 
 Фактическая проверка отказа основного провайдера завершилась успешно: `fallback_used=true`, Tesseract извлек 15/15 полей, после чего результат прошел тот же точный evaluation.
 
+Для первичных PDF/PNG выбран Tesseract `rus+eng`: на документах 07 и 08 он сохранил цифровые реквизиты и суммы, которые PaddleOCR ошибочно смешивал с кириллическими буквами. Для КФЗ остается отдельный квалифицированный PaddleOCR-контур. Это сознательная диверсификация движков по типу документа, а не единый OCR для всех входов.
+
 ## Контейнер
 
 - базовый образ: закрепленный digest `python:3.11-slim`;
 - архитектура проверенного образа: `linux/arm64`;
-- размер локального образа: около 443 МБ;
 - PaddlePaddle 3.2.2;
 - PaddleOCR 3.7.0;
 - Tesseract 5.5.0 с `rus` и `eng`;
@@ -59,24 +61,34 @@ PDF отчета
 
 ## Запуск
 
-Production-экстракция без эталона:
+Полный сценарий без эталона:
 
 ```bash
-docker compose build report-ocr
-docker compose run --rm report-ocr
+bash scripts/download_case19.sh
+docker compose run --rm --build pipeline
 ```
 
-Строгий evaluation основного и резервного движков:
+Повторный запуск переиспользует OCR только при совпадении SHA-256, провайдера и DPI. Отдельные стадии и строгий evaluation движков:
 
 ```bash
+docker compose run --rm source-ocr
+docker compose run --rm report-ocr
+docker compose run --rm registry
+docker compose run --rm reconciliation
 docker compose run --rm ocr-benchmark
 ```
 
-Полученный production-артефакт: `artifacts/linux-report-ocr/report-ocr.json`. Скрипт сверки автоматически предпочитает его macOS-артефакту:
+Основные полученные артефакты:
 
-```bash
-bash scripts/run_case19_reconciliation.sh
-```
+- `artifacts/case19-registry/results/document-registry.json`;
+- `artifacts/linux-report-ocr/report-ocr.json`;
+- `artifacts/case19-reconciliation/reconciliation.json`;
+- `artifacts/case19-reconciliation/reconciliation.md`;
+- `artifacts/pipeline-summary.json`.
+
+На чистом каталоге артефактов полный прогон дал 26 файлов, 22 первичных документа, 19 допущенных операций, 0 `REVIEW`, 0 технических ошибок и заключение `REPORT_UNRELIABLE` с подтвержденным завышением 12 500,00 руб. Повторный прогон взял все 10 OCR-артефактов первичных PDF/PNG из валидного кэша.
+
+В отдельном отказоустойчивом сценарии добавлен поврежденный PDF. Конвейер завершил обработку остальных файлов, зарегистрировал один технический `REVIEW` и вернул `INSUFFICIENT_DATA / SOURCE_DOCUMENT_PROCESSING_INCOMPLETE` без ложного расчета финансовой дельты.
 
 ## Границы результата
 
@@ -84,4 +96,4 @@ bash scripts/run_case19_reconciliation.sh
 - Для новых шаблонов необходим отдельный размеченный набор и тот же строгий cell-level evaluation.
 - Tesseract квалифицирован только как full-page fallback при 400 DPI.
 - Низкая уверенность, отсутствие ячейки или нечисловое значение должны приводить к повторному режиму либо `FAIL`, а не к подстановке ожидаемой суммы.
-- Контейнеризация API, очереди обработки и пользовательского интерфейса остаются следующим продуктовым этапом; текущий образ закрывает переносимый OCR-контур.
+- Полный пакетный CLI-конвейер контейнеризирован; HTTP API, очередь задач и пользовательский интерфейс остаются отдельным продуктовым этапом.

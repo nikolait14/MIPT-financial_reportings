@@ -49,6 +49,7 @@ class JobRecord:
     verification_id: str
     context: dict[str, Any]
     workspace: Path | None
+    owner_session_hash: str
     status: JobStatus = JobStatus.QUEUED
     stage: str = "QUEUED"
     progress: int = 0
@@ -66,6 +67,7 @@ class JobRecord:
         return {
             "verification_id": self.verification_id,
             "context": self.context,
+            "owner_session_hash": self.owner_session_hash,
             "status": self.status.value,
             "stage": self.stage,
             "progress": self.progress,
@@ -123,6 +125,7 @@ class VerificationJobManager:
                     verification_id=manifest["verification_id"],
                     context=manifest["context"],
                     workspace=self.storage.run_path(manifest["verification_id"]),
+                    owner_session_hash=manifest.get("owner_session_hash", ""),
                     status=status,
                     stage=manifest.get("stage", status.value),
                     progress=int(manifest.get("progress", 0)),
@@ -160,7 +163,7 @@ class VerificationJobManager:
             except (KeyError, ValueError, TypeError):
                 continue
 
-    def allocate(self, context: dict[str, Any]) -> JobRecord:
+    def allocate(self, context: dict[str, Any], owner_session_hash: str) -> JobRecord:
         self.cleanup_expired()
         verification_id = str(uuid.uuid4())
         workspace = self.storage.create(verification_id)
@@ -168,6 +171,7 @@ class VerificationJobManager:
             verification_id=verification_id,
             context=context,
             workspace=workspace,
+            owner_session_hash=owner_session_hash,
         )
         job.events.append(
             {
@@ -224,6 +228,7 @@ class VerificationJobManager:
                 reconciliation=output.reconciliation,
                 extraction=output.extraction,
                 artifacts_dir=output.artifacts_dir,
+                workspace=job.workspace,
                 storage_mode=self.storage_mode,
                 confidence_warning=self.settings.ocr_confidence_warning,
             )
@@ -255,7 +260,10 @@ class VerificationJobManager:
         except Exception as error:  # noqa: BLE001 - worker boundary
             self._fail(job, "INTERNAL", "INTERNAL_ERROR", str(error))
         finally:
-            if not self.settings.is_persistent:
+            # EPHEMERAL files remain only until the TTL so the owning browser
+            # can inspect page evidence. cleanup_expired() removes the whole
+            # workspace, including previews, as one unit.
+            if not self.settings.is_persistent and job.status == JobStatus.FAILED:
                 self.storage.delete(job.verification_id)
                 with self._lock:
                     job.workspace = None
@@ -362,7 +370,7 @@ class VerificationJobManager:
         source = self.get(verification_id)
         if source.workspace is None or not (source.workspace / "input").exists():
             raise JobConflictError("Source documents are not available")
-        target = self.allocate(dict(source.context))
+        target = self.allocate(dict(source.context), source.owner_session_hash)
         assert target.workspace is not None
         for path in (source.workspace / "input").iterdir():
             if path.is_file():

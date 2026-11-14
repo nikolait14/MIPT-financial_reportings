@@ -25,6 +25,7 @@
   "article_report_fields": {
     "0200": "wages_total",
     "0300": "insurance_total",
+    "0400": "materials",
     "0800": "overhead_0800",
     "0900": "administrative_0900"
   },

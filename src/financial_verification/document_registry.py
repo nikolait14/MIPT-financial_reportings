@@ -9,6 +9,7 @@ import hashlib
 import json
 import re
 import statistics
+import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import date
@@ -20,10 +21,15 @@ from docx import Document
 from openpyxl import load_workbook
 from openpyxl.utils.cell import range_boundaries
 
+from financial_verification.financial_parsing import money_spans, parse_money_literal
+
 
 DATE_RE = re.compile(r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?!\d)")
+DATE_RANGE_RE = re.compile(
+    r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{4})\s*(?:—|–|-)\s*"
+    r"(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?!\d)"
+)
 CONTRACT_RE = re.compile(r"(?<!\d)(\d{2}/\d{2}/\d{2}-\d{2})(?!\d)")
-AMOUNT_RE = re.compile(r"(?<!\d)(\d{1,3}(?:[ \u00a0]\d{3})*[,.]\d{2})(?!\d)")
 DOC_NUMBER_RE = re.compile(r"(?:№|N[º°oО]?|No)\s*([A-Za-zА-Яа-я0-9-]+)", re.IGNORECASE)
 
 MONTHS = {
@@ -60,6 +66,7 @@ class Evidence:
     locator: str
     raw: str
     bbox: list[int] | None = None
+    confidence: float | None = None
 
 
 @dataclass
@@ -69,6 +76,7 @@ class ExtractedContent:
     evidence_by_line: list[Evidence]
     amount: Decimal | None = None
     amount_evidence: Evidence | None = None
+    extraction_issues: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -89,6 +97,7 @@ class DocumentRecord:
     period_from: str | None = None
     period_to: str | None = None
     amount: str | None = None
+    currency: str | None = None
     extraction_method: str | None = None
     evidence: dict[str, dict[str, Any]] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
@@ -123,9 +132,8 @@ def role_for_file(file_name: str, context: dict[str, Any]) -> str:
 
 
 def normalize_decimal(raw: str) -> Decimal | None:
-    value = raw.replace("\u00a0", " ").replace(" ", "").replace(",", ".")
     try:
-        return Decimal(value)
+        return parse_money_literal(raw)
     except InvalidOperation:
         return None
 
@@ -269,60 +277,83 @@ def extract_ocr(path: Path, ocr_dir: Path) -> ExtractedContent:
     source_hash = payload.get("sourceSha256")
     if source_hash and source_hash != sha256_file(path):
         raise ValueError(f"Stale OCR result for {path.name}: source SHA-256 changed")
-    observations = [
-        item for item in payload["observations"] if item.get("text", "").strip()
-    ]
-    heights = [item["bboxPixels"][3] for item in observations if item["bboxPixels"][3] > 0]
-    tolerance = max(5.0, (statistics.median(heights) if heights else 10.0) * 0.6)
-    visual_lines: list[list[dict[str, Any]]] = []
-    for observation in sorted(
-        observations,
-        key=lambda item: (
-            item["bboxPixels"][1] + item["bboxPixels"][3] / 2,
-            item["bboxPixels"][0],
-        ),
-    ):
-        center_y = observation["bboxPixels"][1] + observation["bboxPixels"][3] / 2
-        matching_line = min(
-            visual_lines,
-            key=lambda line: abs(
-                center_y
-                - statistics.median(
-                    item["bboxPixels"][1] + item["bboxPixels"][3] / 2
-                    for item in line
-                )
-            ),
-            default=None,
-        )
-        if matching_line is not None:
-            line_center = statistics.median(
-                item["bboxPixels"][1] + item["bboxPixels"][3] / 2
-                for item in matching_line
-            )
-            if abs(center_y - line_center) <= tolerance:
-                matching_line.append(observation)
-                continue
-        visual_lines.append([observation])
-
-    visual_lines.sort(
-        key=lambda line: statistics.median(
-            item["bboxPixels"][1] + item["bboxPixels"][3] / 2 for item in line
-        )
-    )
     lines = []
     evidence = []
-    for line in visual_lines:
-        line.sort(key=lambda item: item["bboxPixels"][0])
-        text = " ".join(item["text"].strip() for item in line)
-        left = min(item["bboxPixels"][0] for item in line)
-        top = min(item["bboxPixels"][1] for item in line)
-        right = max(item["bboxPixels"][0] + item["bboxPixels"][2] for item in line)
-        bottom = max(item["bboxPixels"][1] + item["bboxPixels"][3] for item in line)
-        lines.append(text)
-        evidence.append(
-            Evidence(path.name, "page:1", text, [left, top, right - left, bottom - top])
-        )
+    page_payloads = payload.get("pages") or [{"page": 1, **payload}]
+    for page_payload in page_payloads:
+        page_number = int(page_payload.get("page", 1))
+        observations = [
+            item for item in page_payload["observations"] if item.get("text", "").strip()
+        ]
+        heights = [item["bboxPixels"][3] for item in observations if item["bboxPixels"][3] > 0]
+        tolerance = max(5.0, (statistics.median(heights) if heights else 10.0) * 0.6)
+        visual_lines: list[list[dict[str, Any]]] = []
+        for observation in sorted(
+            observations,
+            key=lambda item: (item["bboxPixels"][1] + item["bboxPixels"][3] / 2, item["bboxPixels"][0]),
+        ):
+            center_y = observation["bboxPixels"][1] + observation["bboxPixels"][3] / 2
+            matching_line = min(
+                visual_lines,
+                key=lambda line: abs(center_y - statistics.median(item["bboxPixels"][1] + item["bboxPixels"][3] / 2 for item in line)),
+                default=None,
+            )
+            if matching_line is not None:
+                line_center = statistics.median(item["bboxPixels"][1] + item["bboxPixels"][3] / 2 for item in matching_line)
+                if abs(center_y - line_center) <= tolerance:
+                    matching_line.append(observation)
+                    continue
+            visual_lines.append([observation])
+        for line in sorted(visual_lines, key=lambda row: statistics.median(item["bboxPixels"][1] + item["bboxPixels"][3] / 2 for item in row)):
+            line.sort(key=lambda item: item["bboxPixels"][0])
+            text = " ".join(item["text"].strip() for item in line)
+            left = min(item["bboxPixels"][0] for item in line)
+            top = min(item["bboxPixels"][1] for item in line)
+            right = max(item["bboxPixels"][0] + item["bboxPixels"][2] for item in line)
+            bottom = max(item["bboxPixels"][1] + item["bboxPixels"][3] for item in line)
+            lines.append(text)
+            confidences = [
+                float(item["confidence"])
+                for item in line
+                if item.get("confidence") is not None
+            ]
+            evidence.append(
+                Evidence(
+                    path.name,
+                    f"page:{page_number}",
+                    text,
+                    [left, top, right - left, bottom - top],
+                    min(confidences) if confidences else None,
+                )
+            )
     return ExtractedContent("\n".join(lines), lines, evidence)
+
+
+def extract_pdf_text(path: Path) -> ExtractedContent | None:
+    """Read a searchable PDF before using OCR; retain page-level locators."""
+    try:
+        completed = subprocess.run(
+            ["pdftotext", "-layout", str(path), "-"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    pages = completed.stdout.split("\f")
+    lines: list[str] = []
+    evidence: list[Evidence] = []
+    for page_number, page_text in enumerate(pages, start=1):
+        for line_number, raw in enumerate(page_text.splitlines(), start=1):
+            text = raw.strip()
+            if not text:
+                continue
+            lines.append(text)
+            evidence.append(Evidence(path.name, f"page:{page_number}:line:{line_number}", text))
+    # A few isolated glyphs are not a usable text layer and should not prevent
+    # OCR from reading a scan with a broken hidden layer.
+    meaningful = sum(char.isalnum() for line in lines for char in line)
+    return ExtractedContent("\n".join(lines), lines, evidence) if meaningful >= 20 else None
 
 
 def find_evidence(content: ExtractedContent, raw: str) -> Evidence | None:
@@ -339,12 +370,66 @@ def extract_contract(content: ExtractedContent) -> tuple[str | None, Evidence | 
     return match.group(1), find_evidence(content, match.group(1))
 
 
+def _set_issue(content: ExtractedContent, reason_code: str) -> None:
+    if reason_code not in content.extraction_issues:
+        content.extraction_issues.append(reason_code)
+
+
 def extract_date_or_period(content: ExtractedContent, file_name: str) -> tuple[str | None, str | None, str | None, Evidence | None]:
-    match = DATE_RE.search(content.text)
-    if match:
-        value = iso_date(*match.groups())
-        if value:
-            return value, value, value, find_evidence(content, match.group(0))
+    """Extract a labelled document date or reporting period without choosing first date.
+
+    A document can contain a signing date, a service period and an invoice date.
+    Unlabelled conflicting dates are intentionally routed to REVIEW instead of
+    becoming a random period filter.
+    """
+    labelled_date_markers = (
+        "дата документа",
+        "дата акта",
+        "дата составления",
+        "дата счета",
+        "от ",
+    )
+    period_markers = ("за период", "период", "отчетный период", "оказанных услуг")
+    date_matches = list(DATE_RE.finditer(content.text))
+    unique_values = {
+        value
+        for match in date_matches
+        if (value := iso_date(*match.groups())) is not None
+    }
+    single_document_date = next(iter(unique_values)) if len(unique_values) == 1 else None
+    # A labelled service period takes precedence over the date the document was
+    # created, even if the document date occurs earlier on the page.
+    for line, evidence in zip(content.lines, content.evidence_by_line):
+        lower = line.lower().replace("ё", "е")
+        range_match = DATE_RANGE_RE.search(line)
+        if range_match and any(marker in lower for marker in period_markers):
+            start = iso_date(*range_match.groups()[:3])
+            end = iso_date(*range_match.groups()[3:])
+            if start and end and start <= end:
+                return single_document_date, start, end, evidence
+            _set_issue(content, "INVALID_DATE_RANGE")
+            return None, None, None, evidence
+        period = month_period(line)
+        if period and any(marker in lower for marker in period_markers + ("за ",)):
+            return single_document_date, period[0], period[1], evidence
+
+    for line, evidence in zip(content.lines, content.evidence_by_line):
+        lower = line.lower().replace("ё", "е")
+        match = DATE_RE.search(line)
+        if match and any(marker in lower for marker in labelled_date_markers):
+            value = iso_date(*match.groups())
+            if value:
+                return value, value, value, evidence
+
+    # A single full date without a label is still unambiguous.  Several dates
+    # need a label: first occurrence is not a business rule.
+    if len(unique_values) == 1:
+        value = next(iter(unique_values))
+        raw_match = next(match for match in date_matches if iso_date(*match.groups()) == value)
+        return value, value, value, find_evidence(content, raw_match.group(0))
+    if len(unique_values) > 1:
+        _set_issue(content, "AMBIGUOUS_DATE_OR_PERIOD")
+        return None, None, None, None
 
     file_match = re.search(r"(\d{2})-(\d{2})-(20\d{2})", file_name)
     if file_match:
@@ -375,23 +460,88 @@ def extract_document_number(content: ExtractedContent, file_name: str) -> tuple[
     return fallback, Evidence(file_name, "file_name", fallback)
 
 
+def _date_span_overlaps(line: str, start: int, end: int) -> bool:
+    return any(start < match.end() and end > match.start() for match in DATE_RE.finditer(line))
+
+
 def extract_amount(content: ExtractedContent) -> tuple[Decimal | None, Evidence | None]:
+    """Extract one defensible amount or emit an explicit REVIEW-worthy issue.
+
+    We do not use "largest number wins": VAT and subtotal documents often have
+    several perfectly valid values.  The selected value must be uniquely best
+    by an explicit total/payment label.
+    """
     if content.amount is not None:
         return content.amount, content.amount_evidence
 
-    keywords = ("итого", "сумма", "стоимость", "оплате", "всего")
+    keywords = ("итого", "сумма", "стоимость", "оплате", "всего", "к перечислению")
+    strongest_keywords = ("итого", "всего", "к оплате", "к перечислению")
     candidates: list[tuple[int, Decimal, str, Evidence | None]] = []
+    explicit_currency: set[str] = set()
+    has_unsupported_unit = False
+    previous_line_has_amount_label = False
     for line in content.lines:
         line_lower = line.lower()
-        score = 1 + (10 if any(keyword in line_lower for keyword in keywords) else 0)
-        for match in AMOUNT_RE.finditer(line):
-            value = normalize_decimal(match.group(1))
+        if any(marker in line_lower for marker in ("тыс. руб", "тысяч рублей", "млн руб")):
+            has_unsupported_unit = True
+        if any(marker in line_lower for marker in ("usd", "долл", "$")):
+            explicit_currency.add("USD")
+        if any(marker in line_lower for marker in ("eur", "евро", "€")):
+            explicit_currency.add("EUR")
+        if any(marker in line_lower for marker in ("руб", "rur", "rub", "₽")):
+            explicit_currency.add("RUB")
+        score = 1
+        if any(keyword in line_lower for keyword in keywords):
+            score += 10
+        # DOCX tables commonly put "Сумма" in a header row and the value in
+        # the following row.  Preserve that structure instead of falling back
+        # to the largest unlabelled number in the document.
+        if previous_line_has_amount_label:
+            score += 10
+        if any(keyword in line_lower for keyword in strongest_keywords):
+            score += 10
+        has_non_date_money = False
+        for match in money_spans(line):
+            if _date_span_overlaps(line, match.start(), match.end()):
+                continue
+            # A hyphen in an identifier (for example KЛ-31) is not a negative
+            # financial value.  A real negative amount starts a token.
+            if (
+                match.group(0).startswith("-")
+                and match.start() > 0
+                and line[match.start() - 1].isalnum()
+            ):
+                continue
+            value = normalize_decimal(match.group(0))
             if value is not None:
-                candidates.append((score, value, match.group(1), find_evidence(content, line)))
+                has_non_date_money = True
+                candidates.append((score, value, match.group(0), find_evidence(content, line)))
+        previous_line_has_amount_label = (
+            any(keyword in line_lower for keyword in keywords) and not has_non_date_money
+        )
 
-    if not candidates:
+    if has_unsupported_unit:
+        _set_issue(content, "UNSUPPORTED_AMOUNT_UNIT")
         return None, None
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    if explicit_currency - {"RUB"}:
+        _set_issue(content, "UNSUPPORTED_CURRENCY")
+        return None, None
+    if not candidates:
+        _set_issue(content, "AMOUNT_NOT_EXTRACTED")
+        return None, None
+    if "ндс" in content.text.lower() and len({item[1] for item in candidates}) > 1:
+        _set_issue(content, "AMBIGUOUS_VAT_AMOUNT")
+        return None, None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    highest_score = candidates[0][0]
+    top_candidates = [item for item in candidates if item[0] == highest_score]
+    top_values = {item[1] for item in top_candidates}
+    if len(top_values) > 1:
+        _set_issue(
+            content,
+            "AMBIGUOUS_VAT_AMOUNT" if "ндс" in content.text.lower() else "AMBIGUOUS_AMOUNT",
+        )
+        return None, None
     _, value, raw, evidence = candidates[0]
     if evidence is None:
         evidence = Evidence("unknown", "text", raw)
@@ -408,7 +558,15 @@ def extract_content(path: Path, ocr_dir: Path) -> tuple[ExtractedContent, str]:
         return extract_docx(path), "native_docx"
     if extension == ".xlsx":
         return extract_xlsx(path), "native_xlsx"
-    if extension in {".pdf", ".png"}:
+    if extension == ".pdf":
+        native = extract_pdf_text(path)
+        if native is not None:
+            return native, "native_pdf_text"
+        ocr_path = ocr_dir / f"{path.stem}.json"
+        payload = json.loads(ocr_path.read_text(encoding="utf-8")) if ocr_path.exists() else {}
+        provider = payload.get("provider", "legacy")
+        return extract_ocr(path, ocr_dir), f"ocr:{provider}"
+    if extension == ".png":
         ocr_path = ocr_dir / f"{path.stem}.json"
         payload = json.loads(ocr_path.read_text(encoding="utf-8")) if ocr_path.exists() else {}
         provider = payload.get("provider", "legacy")
@@ -484,6 +642,13 @@ def apply_context_decision(record: DocumentRecord, context: dict[str, Any]) -> N
             record.decision = "EXCLUDE"
             record.reason_code = "OUT_OF_PERIOD"
             return
+        if (
+            record.period_from < context["period_from"]
+            or record.period_to > context["period_to"]
+        ):
+            record.decision = "REVIEW"
+            record.reason_code = "PARTIALLY_OUT_OF_PERIOD"
+            return
     record.decision = "INCLUDE"
     record.reason_code = "VALID"
 
@@ -501,6 +666,7 @@ def hydrate_duplicate_fields(records: list[DocumentRecord]) -> None:
             "period_from",
             "period_to",
             "amount",
+            "currency",
             "extraction_method",
         ):
             setattr(record, attribute, getattr(original, attribute))
@@ -531,6 +697,7 @@ def process_records(
             record.period_from = period_from
             record.period_to = period_to
             record.amount = f"{amount:.2f}" if amount is not None else None
+            record.currency = "RUB" if amount is not None else None
             record.extraction_method = method
             record.processing_status = "PROCESSED"
             record.evidence = {
@@ -549,10 +716,11 @@ def process_records(
                 record.warnings.append("DATE_OR_PERIOD_NOT_EXTRACTED")
             if amount is None:
                 record.warnings.append("AMOUNT_NOT_EXTRACTED")
+            record.warnings.extend(content.extraction_issues)
             if record.warnings:
                 record.processing_status = "PARTIALLY_PROCESSED"
                 record.decision = "REVIEW"
-                record.reason_code = "EXTRACTION_INCOMPLETE"
+                record.reason_code = content.extraction_issues[0] if content.extraction_issues else "EXTRACTION_INCOMPLETE"
             else:
                 apply_context_decision(record, context)
         except Exception as error:  # noqa: BLE001 - boundary must isolate file errors
@@ -591,6 +759,7 @@ def write_outputs(records: list[DocumentRecord], context: dict[str, Any], output
         "period_to",
         "contract_number",
         "amount",
+        "currency",
         "decision",
         "reason_code",
         "duplicate_of",

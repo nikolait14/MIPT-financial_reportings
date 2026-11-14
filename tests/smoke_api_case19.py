@@ -72,7 +72,19 @@ def main() -> int:
                 files=files,
             )
         response.raise_for_status()
+        require("httponly" in response.headers.get("set-cookie", "").lower(), "Missing HttpOnly session cookie")
         verification_id = response.json()["verification_id"]
+
+        with httpx.Client(base_url=args.base_url, timeout=60) as intruder:
+            denied = intruder.get(f"/api/v1/verifications/{verification_id}")
+            require(
+                denied.status_code == 404,
+                f"Unrelated session reached verification: {denied.status_code}",
+            )
+            require(
+                intruder.get("/api/v1/verifications").json() == {"items": []},
+                "Unrelated session received verification history",
+            )
 
         deadline = time.monotonic() + args.timeout
         status_payload = None
@@ -135,13 +147,19 @@ def main() -> int:
         source_document = next(
             item
             for item in result["documents"]
-            if item["role"] == "SOURCE_DOCUMENT"
+            if item["role"] == "SOURCE_DOCUMENT" and item.get("pages")
         )
         content = client.get(
             f"/api/v1/verifications/{verification_id}/documents/"
             f"{source_document['document_id']}/content"
         )
         require(content.status_code == 410, f"Expected 410, got {content.status_code}")
+        page = client.get(
+            f"/api/v1/verifications/{verification_id}/documents/"
+            f"{source_document['document_id']}/pages/1"
+        )
+        require(page.status_code == 200, f"Expected page preview, got {page.status_code}")
+        require(page.headers.get("content-type", "").startswith("image/png"), page.headers)
 
         markdown = client.get(
             f"/api/v1/verifications/{verification_id}/export?format=markdown"
@@ -159,6 +177,8 @@ def main() -> int:
                     "delta": summary["delta"],
                     "evidence_checked": 1 + len(finding["source_evidence_ids"]),
                     "ephemeral_document_response": content.status_code,
+                    "ephemeral_page_response": page.status_code,
+                    "unrelated_session_response": denied.status_code,
                 },
                 ensure_ascii=False,
             )

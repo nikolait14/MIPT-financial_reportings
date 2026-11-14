@@ -14,6 +14,12 @@ from pathlib import Path
 from typing import Any
 
 from financial_verification.document_registry import ExtractedContent, extract_content
+from financial_verification.financial_parsing import parse_money_literal
+from financial_verification.report_schema import (
+    article_display_name,
+    article_report_fields,
+    report_field_ids,
+)
 
 
 MONEY_QUANTUM = Decimal("0.01")
@@ -99,23 +105,7 @@ def decimal_string(value: Decimal) -> str:
 
 
 def parse_decimal(raw: str) -> Decimal:
-    value = raw.strip().replace("\u00a0", " ")
-    if not value or re.search(r"[^0-9\s,\.\-+]", value):
-        raise InvalidOperation(f"Invalid characters in number {raw!r}")
-    value = re.sub(r"\s+", "", value)
-    if not re.fullmatch(r"[+-]?\d+(?:[.,]\d+)*", value):
-        raise InvalidOperation(f"Invalid number format {raw!r}")
-    if "," in value and "." in value:
-        if value.rfind(",") > value.rfind("."):
-            value = value.replace(".", "").replace(",", ".")
-        else:
-            value = value.replace(",", "")
-    elif "," in value:
-        value = value.replace(",", ".")
-    elif value.count(".") > 1:
-        parts = value.split(".")
-        value = "".join(parts[:-1]) + "." + parts[-1]
-    return Decimal(value).quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+    return parse_money_literal(raw)
 
 
 def normalized_text(value: str) -> str:
@@ -258,7 +248,7 @@ def build_operations(
                     period_from=record["period_from"],
                     period_to=record["period_to"],
                     amount=record["amount"],
-                    currency="RUB",
+                    currency=record.get("currency") or "RUB",
                     amount_evidence=record["evidence"].get("amount"),
                     classification=ClassificationResult(
                         status="REVIEW",
@@ -312,7 +302,7 @@ def build_operations(
                 period_from=record["period_from"],
                 period_to=record["period_to"],
                 amount=amount,
-                currency="RUB",
+                currency=record.get("currency") or "RUB",
                 amount_evidence=record["evidence"].get("amount"),
                 classification=classification,
                 line_items=line_items,
@@ -381,6 +371,32 @@ def comparison_status(report_value: Decimal, supported_value: Decimal) -> tuple[
     return "MISMATCH", "REPORT_UNDERSTATED", "UNDERSTATEMENT"
 
 
+def interval_comparison(
+    report_value: Decimal,
+    lower_bound: Decimal,
+    review_upper_bound: Decimal,
+    has_unquantified_review: bool,
+    reason_code: str,
+) -> tuple[str, str, str, Decimal | None]:
+    """Compare against a defensible range when unclassified operations exist.
+
+    A known but unclassified amount may belong to any article.  It must not
+    erase a mismatch that remains outside even the most generous range.  An
+    unreadable document with no amount stays insufficient: no honest bound is
+    available.
+    """
+    if has_unquantified_review:
+        return "INSUFFICIENT_DATA", reason_code, "UNKNOWN", None
+    upper_bound = lower_bound + review_upper_bound
+    if report_value < lower_bound:
+        status, comparison_reason, direction = comparison_status(report_value, lower_bound)
+        return status, comparison_reason, direction, lower_bound
+    if report_value > upper_bound:
+        status, comparison_reason, direction = comparison_status(report_value, upper_bound)
+        return status, comparison_reason, direction, upper_bound
+    return "INSUFFICIENT_DATA", reason_code, "UNKNOWN", upper_bound
+
+
 def reconcile(
     operations: list[Operation],
     report_fields: dict[str, Any],
@@ -399,13 +415,26 @@ def reconcile(
         if technical_review
         else "UNCLASSIFIED_OPERATIONS_PRESENT"
     )
+    quantified_review_amount = sum(
+        (Decimal(op.amount) for op in review if op.amount is not None), Decimal("0")
+    )
+    has_unquantified_review = any(op.amount is None for op in review)
     article_results = []
+    configured_article_fields = article_report_fields(context)
 
-    for article_code, report_field_id in context["article_report_fields"].items():
+    for article_code, report_field_id in configured_article_fields.items():
         sources = [op for op in classified if op.classification.article_code == article_code]
         supported = sum((Decimal(op.amount) for op in sources if op.amount is not None), Decimal("0"))
         report_value = Decimal(report_fields[report_field_id]["value"])
-        if not sources:
+        supported_by_rules = article_code in rules["articles"]
+        if not supported_by_rules:
+            status = "INSUFFICIENT_DATA"
+            reason_code = "UNSUPPORTED_ARTICLE"
+            direction = "UNKNOWN"
+            supported_value = None
+            delta = None
+            supported_value_is_partial = False
+        elif not sources:
             status = "INSUFFICIENT_DATA"
             reason_code = "MISSING_DOCUMENT"
             direction = "UNKNOWN"
@@ -413,11 +442,19 @@ def reconcile(
             delta = None
             supported_value_is_partial = False
         elif review:
-            status = "INSUFFICIENT_DATA"
-            reason_code = review_reason
-            direction = "UNKNOWN"
+            status, reason_code, direction, upper_bound = interval_comparison(
+                report_value,
+                supported,
+                quantified_review_amount,
+                has_unquantified_review,
+                review_reason,
+            )
             supported_value = decimal_string(supported)
-            delta = None
+            delta = (
+                decimal_string(report_value - upper_bound)
+                if status == "MISMATCH" and upper_bound is not None
+                else None
+            )
             supported_value_is_partial = True
         else:
             status, reason_code, direction = comparison_status(report_value, supported)
@@ -427,11 +464,17 @@ def reconcile(
         article_results.append(
             {
                 "article_code": article_code,
-                "article_name": rules["articles"][article_code]["name"],
+                "article_name": article_display_name(article_code, context, rules),
+                "article_supported": supported_by_rules,
                 "report_field_id": report_field_id,
                 "report_value": decimal_string(report_value),
                 "supported_value": supported_value,
                 "supported_value_is_partial": supported_value_is_partial,
+                "supported_value_upper_bound": (
+                    decimal_string(supported + quantified_review_amount)
+                    if review and not has_unquantified_review
+                    else None
+                ),
                 "delta_report_minus_supported": delta,
                 "status": status,
                 "reason_code": reason_code,
@@ -460,13 +503,33 @@ def reconcile(
     )
     total_field_id = context["total_report_field"]
     total_report = Decimal(report_fields[total_field_id]["value"])
-    missing_article_sources = any(item["source_count"] == 0 for item in article_results)
+    # A displayed but unsupported zero-valued article does not add an unknown
+    # amount to the total.  It must remain visible as UNSUPPORTED_ARTICLE, but
+    # cannot hide a confirmed discrepancy in the independently supported
+    # articles. A non-zero unsupported article still makes the total partial.
+    missing_article_sources = any(
+        item["article_supported"]
+        and item["source_count"] == 0
+        or (
+            not item["article_supported"]
+            and Decimal(item["report_value"]) != Decimal("0")
+        )
+        for item in article_results
+    )
     if review:
-        total_status = "INSUFFICIENT_DATA"
-        total_reason = review_reason
-        total_direction = "UNKNOWN"
+        total_status, total_reason, total_direction, total_upper_bound = interval_comparison(
+            total_report,
+            total_supported,
+            quantified_review_amount,
+            has_unquantified_review,
+            review_reason,
+        )
         total_value = decimal_string(total_supported) if classified else None
-        total_delta = None
+        total_delta = (
+            decimal_string(total_report - total_upper_bound)
+            if total_status == "MISMATCH" and total_upper_bound is not None
+            else None
+        )
         total_is_partial = True
     elif missing_article_sources:
         total_status = "INSUFFICIENT_DATA"
@@ -487,6 +550,11 @@ def reconcile(
         "report_value": decimal_string(total_report),
         "supported_value": total_value,
         "supported_value_is_partial": total_is_partial,
+        "supported_value_upper_bound": (
+            decimal_string(total_supported + quantified_review_amount)
+            if review and not has_unquantified_review
+            else None
+        ),
         "delta_report_minus_supported": total_delta,
         "status": total_status,
         "reason_code": total_reason,
@@ -504,13 +572,13 @@ def reconcile(
     report_article_sum = sum(
         (
             Decimal(report_fields[field_id]["value"])
-            for field_id in context["article_report_fields"].values()
+            for field_id in configured_article_fields.values()
         ),
         Decimal("0"),
     )
     report_consistency_delta = total_report - report_article_sum
     report_consistency = {
-        "article_field_ids": list(context["article_report_fields"].values()),
+        "article_field_ids": list(configured_article_fields.values()),
         "total_field_id": total_field_id,
         "article_sum": decimal_string(report_article_sum),
         "row_total": decimal_string(total_report),
@@ -608,15 +676,15 @@ def reconcile(
     if report_consistency["status"] == "MISMATCH":
         conclusion_status = "REPORT_UNRELIABLE"
         conclusion_reason = "REPORT_TOTAL_INCONSISTENT"
+    elif mismatches or detail_mismatches or total_status == "MISMATCH":
+        conclusion_status = "REPORT_UNRELIABLE"
+        conclusion_reason = "CONFIRMED_FINANCIAL_DISCREPANCY"
     elif review:
         conclusion_status = "INSUFFICIENT_DATA"
         conclusion_reason = review_reason
     elif insufficient_articles:
         conclusion_status = "INSUFFICIENT_DATA"
         conclusion_reason = "MISSING_DOCUMENT"
-    elif mismatches or detail_mismatches or total_status == "MISMATCH":
-        conclusion_status = "REPORT_UNRELIABLE"
-        conclusion_reason = "CONFIRMED_FINANCIAL_DISCREPANCY"
     else:
         conclusion_status = "RELIABLE_FOR_CHECKED_FIELDS"
         conclusion_reason = "NO_CONFIRMED_DISCREPANCY"
@@ -883,7 +951,7 @@ def run(
         raise ReconciliationError("Registry and verification context belong to different cases")
 
     operations = build_operations(registry, input_dir, ocr_dir, rules)
-    report_fields = extract_report_row(report_ocr_path, context["report_row_fields"])
+    report_fields = extract_report_row(report_ocr_path, report_field_ids(context))
     report_ocr_payload = json.loads(report_ocr_path.read_text(encoding="utf-8"))
     report_provider = report_ocr_payload.get("provider", "unknown")
     result = reconcile(operations, report_fields, context, rules)

@@ -16,6 +16,18 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def _boolean(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
 @dataclass(frozen=True)
 class ApiSettings:
     storage_mode: str = "ephemeral"
@@ -29,6 +41,9 @@ class ApiSettings:
     max_total_size_bytes: int = 250 * 1024 * 1024
     job_workers: int = 1
     pipeline_stage_timeout_seconds: int = 600
+    session_cookie_name: str = "financial_verification_session"
+    session_ttl_seconds: int = 1800
+    session_cookie_secure: bool = True
     ocr_confidence_warning: float = 0.80
 
     @classmethod
@@ -56,6 +71,11 @@ class ApiSettings:
             pipeline_stage_timeout_seconds=_positive_int(
                 "PIPELINE_STAGE_TIMEOUT_SECONDS", 600
             ),
+            session_cookie_name=os.getenv(
+                "API_SESSION_COOKIE_NAME", "financial_verification_session"
+            ),
+            session_ttl_seconds=_positive_int("API_SESSION_TTL_SECONDS", 1800),
+            session_cookie_secure=_boolean("API_SESSION_COOKIE_SECURE", True),
             ocr_confidence_warning=float(
                 os.getenv("OCR_CONFIDENCE_WARNING", "0.80")
             ),

@@ -1,15 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import hashlib
 import json
+import secrets
 import tempfile
 import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import ValidationError
 
@@ -33,6 +44,7 @@ from financial_verification.backend.service import (
     JobRecord,
     VerificationJobManager,
 )
+from financial_verification.backend.page_artifacts import resolve_page_path
 from financial_verification.backend.tooling import (
     annotate_fields,
     extract_one_document,
@@ -124,9 +136,50 @@ def _status_response(
     )
 
 
-def _job_or_http(manager: VerificationJobManager, verification_id: str) -> JobRecord:
+def _session_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _request_session_hash(request: Request, settings: ApiSettings) -> str | None:
+    token = request.cookies.get(settings.session_cookie_name)
+    if not token or len(token) > 256:
+        return None
+    return _session_hash(token)
+
+
+def _get_or_create_session_hash(
+    request: Request, response: Response, settings: ApiSettings
+) -> str:
+    existing = _request_session_hash(request, settings)
+    if existing is not None:
+        return existing
+    token = secrets.token_urlsafe(32)
+    response.set_cookie(
+        key=settings.session_cookie_name,
+        value=token,
+        max_age=settings.session_ttl_seconds,
+        httponly=True,
+        secure=settings.session_cookie_secure,
+        samesite="lax",
+        path="/",
+    )
+    return _session_hash(token)
+
+
+def _verification_not_found() -> HTTPException:
+    return HTTPException(
+        status_code=404,
+        detail={"code": "VERIFICATION_NOT_FOUND", "message": "Проверка не найдена."},
+    )
+
+
+def _job_or_http(
+    manager: VerificationJobManager,
+    verification_id: str,
+    owner_session_hash: str | None,
+) -> JobRecord:
     try:
-        return manager.get(verification_id)
+        job = manager.get(verification_id)
     except JobExpiredError as error:
         raise HTTPException(
             status_code=410,
@@ -136,10 +189,14 @@ def _job_or_http(manager: VerificationJobManager, verification_id: str) -> JobRe
             },
         ) from error
     except JobNotFoundError as error:
-        raise HTTPException(
-            status_code=404,
-            detail={"code": "VERIFICATION_NOT_FOUND", "message": "Проверка не найдена."},
-        ) from error
+        raise _verification_not_found() from error
+    if (
+        owner_session_hash is None
+        or not job.owner_session_hash
+        or not hmac.compare_digest(job.owner_session_hash, owner_session_hash)
+    ):
+        raise _verification_not_found()
+    return job
 
 
 def _load_context(settings: ApiSettings, raw: str) -> dict[str, Any]:
@@ -249,6 +306,8 @@ def create_app(
         status_code=status.HTTP_202_ACCEPTED,
     )
     async def create_verification(
+        request: Request,
+        response: Response,
         context: Annotated[str, Form()],
         files: Annotated[list[UploadFile], File()],
     ) -> VerificationAccepted:
@@ -263,7 +322,10 @@ def create_app(
                 detail={"code": "TOO_MANY_FILES", "message": "Слишком много файлов."},
             )
         verification_context = _load_context(resolved_settings, context)
-        job = resolved_manager.allocate(verification_context)
+        owner_session_hash = _get_or_create_session_hash(
+            request, response, resolved_settings
+        )
+        job = resolved_manager.allocate(verification_context, owner_session_hash)
         assert job.workspace is not None
         input_dir = job.workspace / "input"
         metadata = []
@@ -318,25 +380,44 @@ def create_app(
     @application.get(
         "/api/v1/verifications", response_model=VerificationListResponse
     )
-    def list_verifications() -> VerificationListResponse:
+    def list_verifications(request: Request) -> VerificationListResponse:
+        owner_session_hash = _request_session_hash(request, resolved_settings)
+        if owner_session_hash is None:
+            return VerificationListResponse(items=[])
         return VerificationListResponse(
-            items=[_status_response(resolved_manager, job) for job in resolved_manager.list()]
+            items=[
+                _status_response(resolved_manager, job)
+                for job in resolved_manager.list()
+                if job.owner_session_hash
+                and hmac.compare_digest(job.owner_session_hash, owner_session_hash)
+            ]
         )
 
     @application.get(
         "/api/v1/verifications/{verification_id}",
         response_model=VerificationStatusResponse,
     )
-    def get_verification(verification_id: str) -> VerificationStatusResponse:
+    def get_verification(
+        verification_id: str, request: Request
+    ) -> VerificationStatusResponse:
         return _status_response(
-            resolved_manager, _job_or_http(resolved_manager, verification_id)
+            resolved_manager,
+            _job_or_http(
+                resolved_manager,
+                verification_id,
+                _request_session_hash(request, resolved_settings),
+            ),
         )
 
     @application.get("/api/v1/verifications/{verification_id}/events")
     async def verification_events(
         verification_id: str, request: Request
     ) -> StreamingResponse:
-        _job_or_http(resolved_manager, verification_id)
+        _job_or_http(
+            resolved_manager,
+            verification_id,
+            _request_session_hash(request, resolved_settings),
+        )
 
         async def stream():
             cursor = 0
@@ -364,12 +445,15 @@ def create_app(
         )
 
     @application.get("/api/v1/verifications/{verification_id}/result")
-    def get_result(verification_id: str) -> JSONResponse:
-        _job_or_http(resolved_manager, verification_id)
+    def get_result(verification_id: str, request: Request) -> JSONResponse:
+        job = _job_or_http(
+            resolved_manager,
+            verification_id,
+            _request_session_hash(request, resolved_settings),
+        )
         try:
             result, _ = resolved_manager.result(verification_id)
         except JobConflictError as error:
-            job = resolved_manager.get(verification_id)
             code = "VERIFICATION_FAILED" if job.status == JobStatus.FAILED else "RESULT_NOT_READY"
             raise HTTPException(
                 status_code=409,
@@ -378,8 +462,12 @@ def create_app(
         return JSONResponse(result)
 
     @application.get("/api/v1/verifications/{verification_id}/documents")
-    def get_documents(verification_id: str) -> dict[str, Any]:
-        job = _job_or_http(resolved_manager, verification_id)
+    def get_documents(verification_id: str, request: Request) -> dict[str, Any]:
+        job = _job_or_http(
+            resolved_manager,
+            verification_id,
+            _request_session_hash(request, resolved_settings),
+        )
         if job.result:
             return {"items": job.result["documents"]}
         return {"items": job.input_files}
@@ -387,8 +475,14 @@ def create_app(
     @application.get(
         "/api/v1/verifications/{verification_id}/documents/{document_id}/content"
     )
-    def get_document_content(verification_id: str, document_id: str):
-        job = _job_or_http(resolved_manager, verification_id)
+    def get_document_content(
+        verification_id: str, document_id: str, request: Request
+    ):
+        job = _job_or_http(
+            resolved_manager,
+            verification_id,
+            _request_session_hash(request, resolved_settings),
+        )
         if not resolved_settings.is_persistent:
             raise HTTPException(
                 status_code=410,
@@ -415,10 +509,43 @@ def create_app(
         return FileResponse(path, filename=document["file_name"])
 
     @application.get(
+        "/api/v1/verifications/{verification_id}/documents/{document_id}/pages/{page}"
+    )
+    def get_document_page(
+        verification_id: str, document_id: str, page: int, request: Request
+    ):
+        job = _job_or_http(
+            resolved_manager,
+            verification_id,
+            _request_session_hash(request, resolved_settings),
+        )
+        if not job.result or job.workspace is None:
+            raise HTTPException(status_code=409, detail={"code": "RESULT_NOT_READY"})
+        document = next(
+            (item for item in job.result["documents"] if item["document_id"] == document_id),
+            None,
+        )
+        if document is None:
+            raise HTTPException(status_code=404, detail={"code": "DOCUMENT_NOT_FOUND"})
+        artifact = next((item for item in document.get("pages", []) if item["page"] == page), None)
+        if artifact is None:
+            raise HTTPException(status_code=404, detail={"code": "PAGE_NOT_FOUND"})
+        path = resolve_page_path(job.workspace, artifact)
+        if path is None:
+            raise HTTPException(status_code=410, detail={"code": "PAGE_EXPIRED"})
+        return FileResponse(path, media_type=artifact.get("media_type", "image/png"))
+
+    @application.get(
         "/api/v1/verifications/{verification_id}/evidence/{evidence_id:path}"
     )
-    def get_evidence(verification_id: str, evidence_id: str) -> dict[str, Any]:
-        job = _job_or_http(resolved_manager, verification_id)
+    def get_evidence(
+        verification_id: str, evidence_id: str, request: Request
+    ) -> dict[str, Any]:
+        job = _job_or_http(
+            resolved_manager,
+            verification_id,
+            _request_session_hash(request, resolved_settings),
+        )
         if not job.result:
             raise HTTPException(status_code=409, detail={"code": "RESULT_NOT_READY"})
         item = next(
@@ -430,8 +557,14 @@ def create_app(
         return item
 
     @application.get("/api/v1/verifications/{verification_id}/export")
-    def export_result(verification_id: str, format: str = "json"):
-        _job_or_http(resolved_manager, verification_id)
+    def export_result(
+        verification_id: str, request: Request, format: str = "json"
+    ):
+        _job_or_http(
+            resolved_manager,
+            verification_id,
+            _request_session_hash(request, resolved_settings),
+        )
         try:
             result, markdown = resolved_manager.result(verification_id)
         except JobConflictError as error:
@@ -459,8 +592,14 @@ def create_app(
         response_model=VerificationAccepted,
         status_code=202,
     )
-    def rerun_verification(verification_id: str) -> VerificationAccepted:
-        _job_or_http(resolved_manager, verification_id)
+    def rerun_verification(
+        verification_id: str, request: Request
+    ) -> VerificationAccepted:
+        _job_or_http(
+            resolved_manager,
+            verification_id,
+            _request_session_hash(request, resolved_settings),
+        )
         try:
             job = resolved_manager.rerun(verification_id)
         except JobConflictError as error:
@@ -480,8 +619,12 @@ def create_app(
     @application.delete(
         "/api/v1/verifications/{verification_id}", status_code=204
     )
-    def delete_verification(verification_id: str):
-        _job_or_http(resolved_manager, verification_id)
+    def delete_verification(verification_id: str, request: Request):
+        _job_or_http(
+            resolved_manager,
+            verification_id,
+            _request_session_hash(request, resolved_settings),
+        )
         try:
             resolved_manager.delete(verification_id)
         except JobConflictError as error:

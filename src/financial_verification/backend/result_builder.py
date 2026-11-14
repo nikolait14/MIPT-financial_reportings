@@ -5,6 +5,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from financial_verification.backend.page_artifacts import build_page_artifacts
+
 
 def _money(value: str | None) -> str:
     if value is None:
@@ -49,7 +51,7 @@ def _locator_from_registry_evidence(
     locator = evidence.get("locator", "unknown")
     bbox = evidence.get("bbox")
     if locator.startswith("page:"):
-        page = int(locator.split(":", 1)[1])
+        page = int(locator.split(":")[1])
         width, height = dimensions or (None, None)
         return {
             "type": "PAGE_REGION",
@@ -98,6 +100,7 @@ def build_verification_result(
     reconciliation: dict[str, Any],
     extraction: dict[str, Any],
     artifacts_dir: Path,
+    workspace: Path,
     storage_mode: str,
     confidence_warning: float,
 ) -> dict[str, Any]:
@@ -106,6 +109,7 @@ def build_verification_result(
     report_record = next(record for record in records if record["role"] == "REPORT")
     content_access = "SERVER" if storage_mode == "PERSISTENT" else "CLIENT_FILE"
 
+    page_artifacts = build_page_artifacts(workspace, records)
     documents = []
     evidence: list[dict[str, Any]] = []
     evidence_by_record_field: dict[tuple[str, str], str] = {}
@@ -114,6 +118,7 @@ def build_verification_result(
         document = {
             **{key: value for key, value in record.items() if key != "evidence"},
             "content_access": content_access,
+            "pages": page_artifacts.get(record["document_id"], []),
         }
         if storage_mode == "PERSISTENT":
             document["content_url"] = (
@@ -134,7 +139,7 @@ def build_verification_result(
                     "locator": _locator_from_registry_evidence(item, dimensions),
                     "raw_text": item.get("raw"),
                     "normalized_value": record.get(field_name),
-                    "confidence": None,
+                    "confidence": item.get("confidence"),
                     "extractor": record.get("extraction_method"),
                     "content_access": content_access,
                 }

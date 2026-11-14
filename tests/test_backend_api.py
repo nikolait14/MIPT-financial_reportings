@@ -6,11 +6,13 @@ import subprocess
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from financial_verification.backend.api import create_app
 from financial_verification.backend.config import ApiSettings
@@ -20,6 +22,7 @@ from financial_verification.backend.pipeline_adapter import (
     PipelineOutput,
 )
 from financial_verification.backend.service import VerificationJobManager, utc_now
+from financial_verification.backend.page_artifacts import build_page_artifacts
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -225,6 +228,23 @@ class FailingRunner:
 
 
 class BackendApiTest(unittest.TestCase):
+    def test_page_artifacts_render_all_pdf_pages_and_detect_text_absence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            input_dir = workspace / "input"
+            input_dir.mkdir()
+            first = Image.new("RGB", (30, 20), "white")
+            second = Image.new("RGB", (30, 20), "black")
+            pdf = input_dir / "scan.pdf"
+            first.save(pdf, "PDF", save_all=True, append_images=[second])
+            pages = build_page_artifacts(
+                workspace,
+                [{"document_id": "scan", "file_name": "scan.pdf"}],
+            )
+            self.assertEqual([item["page"] for item in pages["scan"]], [1, 2])
+            self.assertTrue(all(item["status"] == "AVAILABLE" for item in pages["scan"]))
+            self.assertTrue(all(item["extraction_method"] == "ocr" for item in pages["scan"]))
+
     def make_settings(self, root: Path, *, persistent: bool = False, ttl: int = 60):
         config = root / "config"
         config.mkdir(parents=True, exist_ok=True)
@@ -248,6 +268,8 @@ class BackendApiTest(unittest.TestCase):
             max_total_size_bytes=4096,
             job_workers=1,
             pipeline_stage_timeout_seconds=600,
+            session_ttl_seconds=ttl,
+            session_cookie_secure=False,
         )
 
     def create_job(self, client: TestClient) -> str:
@@ -272,6 +294,29 @@ class BackendApiTest(unittest.TestCase):
             time.sleep(0.01)
         self.fail("Verification did not finish")
 
+    @staticmethod
+    def install_page_preview(manager: VerificationJobManager, verification_id: str) -> None:
+        """Install a controlled preview for API authorization tests.
+
+        The ordinary stub uses intentionally invalid PDF bytes, so Poppler
+        rightly does not create previews in this unit-level test.
+        """
+        job = manager.get(verification_id)
+        assert job.workspace is not None and job.result is not None
+        preview = job.workspace / "artifacts/page-previews/source-id/page-1.png"
+        preview.parent.mkdir(parents=True, exist_ok=True)
+        preview.write_bytes(b"\x89PNG\r\n\x1a\npreview")
+        source = next(item for item in job.result["documents"] if item["document_id"] == "source-id")
+        source["pages"] = [
+            {
+                "page": 1,
+                "media_type": "image/png",
+                "status": "AVAILABLE",
+                "extraction_method": "ocr",
+                "artifact_path": "artifacts/page-previews/source-id/page-1.png",
+            }
+        ]
+
     def test_ephemeral_verification_result_and_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = self.make_settings(Path(directory))
@@ -295,12 +340,18 @@ class BackendApiTest(unittest.TestCase):
                         for item in result["annotations"]
                     )
                 )
-                self.assertFalse(settings.temporary_root.joinpath(verification_id).exists())
+                self.assertTrue(settings.temporary_root.joinpath(verification_id).exists())
 
                 content = client.get(
                     f"/api/v1/verifications/{verification_id}/documents/source-id/content"
                 )
                 self.assertEqual(content.status_code, 410)
+                self.install_page_preview(manager, verification_id)
+                page = client.get(
+                    f"/api/v1/verifications/{verification_id}/documents/source-id/pages/1"
+                )
+                self.assertEqual(page.status_code, 200)
+                self.assertEqual(page.headers["content-type"], "image/png")
                 markdown = client.get(
                     f"/api/v1/verifications/{verification_id}/export?format=markdown"
                 )
@@ -317,6 +368,96 @@ class BackendApiTest(unittest.TestCase):
                     "/api/v1/verifications",
                     openapi.json()["paths"],
                 )
+
+    def test_verification_is_private_to_browser_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = self.make_settings(Path(directory))
+            manager = VerificationJobManager(settings, runner=StubRunner())
+            app = create_app(settings, manager)
+            with TestClient(app) as owner:
+                verification_id = self.create_job(owner)
+                self.assertEqual(self.wait(owner, verification_id)["status"], "COMPLETED")
+                result = owner.get(
+                    f"/api/v1/verifications/{verification_id}/result"
+                )
+                self.assertEqual(result.status_code, 200)
+                evidence_id = result.json()["evidence"][0]["evidence_id"]
+                self.install_page_preview(manager, verification_id)
+                session_cookie = owner.cookies.get(settings.session_cookie_name)
+                self.assertTrue(session_cookie)
+
+                intruder = TestClient(app)
+                try:
+                    self.assertEqual(
+                        intruder.get("/api/v1/verifications").json(), {"items": []}
+                    )
+                    protected = [
+                        intruder.get(f"/api/v1/verifications/{verification_id}"),
+                        intruder.get(
+                            f"/api/v1/verifications/{verification_id}/result"
+                        ),
+                        intruder.get(
+                            f"/api/v1/verifications/{verification_id}/documents"
+                        ),
+                        intruder.get(
+                            f"/api/v1/verifications/{verification_id}/documents/source-id/pages/1"
+                        ),
+                        intruder.get(
+                            f"/api/v1/verifications/{verification_id}/evidence/{evidence_id}"
+                        ),
+                        intruder.get(
+                            f"/api/v1/verifications/{verification_id}/export"
+                        ),
+                        intruder.post(
+                            f"/api/v1/verifications/{verification_id}/rerun"
+                        ),
+                        intruder.delete(
+                            f"/api/v1/verifications/{verification_id}"
+                        ),
+                    ]
+                    for response in protected:
+                        self.assertEqual(response.status_code, 404, response.text)
+                        self.assertEqual(
+                            response.json()["detail"]["code"],
+                            "VERIFICATION_NOT_FOUND",
+                        )
+                    unknown = intruder.get(
+                        "/api/v1/verifications/00000000-0000-0000-0000-000000000000"
+                    )
+                    self.assertEqual(unknown.status_code, 404)
+                    self.assertEqual(
+                        protected[0].json()["detail"], unknown.json()["detail"]
+                    )
+                finally:
+                    intruder.close()
+
+                owner_list = owner.get("/api/v1/verifications")
+                self.assertEqual(owner_list.status_code, 200)
+                self.assertEqual(
+                    [item["verification_id"] for item in owner_list.json()["items"]],
+                    [verification_id],
+                )
+
+    def test_session_cookie_is_http_only_lax_and_secure_in_production_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(
+                self.make_settings(Path(directory)), session_cookie_secure=True
+            )
+            manager = VerificationJobManager(settings, runner=StubRunner())
+            with TestClient(create_app(settings, manager)) as client:
+                response = client.post(
+                    "/api/v1/verifications",
+                    data={"context": json.dumps(api_context(), ensure_ascii=False)},
+                    files=[
+                        ("files", ("report.pdf", b"report", "application/pdf")),
+                        ("files", ("source.pdf", b"source", "application/pdf")),
+                    ],
+                )
+                self.assertEqual(response.status_code, 202, response.text)
+                cookie = response.headers["set-cookie"]
+                self.assertIn("HttpOnly", cookie)
+                self.assertIn("SameSite=lax", cookie)
+                self.assertIn("Secure", cookie)
 
     def test_ephemeral_failed_job_also_cleans_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -372,6 +513,7 @@ class BackendApiTest(unittest.TestCase):
             with TestClient(create_app(settings, manager)) as client:
                 verification_id = self.create_job(client)
                 self.wait(client, verification_id)
+                session_cookie = client.cookies.get(settings.session_cookie_name)
                 content = client.get(
                     f"/api/v1/verifications/{verification_id}/documents/source-id/content"
                 )
@@ -380,6 +522,7 @@ class BackendApiTest(unittest.TestCase):
 
             restored_manager = VerificationJobManager(settings, runner=StubRunner())
             with TestClient(create_app(settings, restored_manager)) as restored:
+                restored.cookies.set(settings.session_cookie_name, session_cookie)
                 status_response = restored.get(
                     f"/api/v1/verifications/{verification_id}"
                 )

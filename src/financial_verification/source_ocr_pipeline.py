@@ -41,6 +41,44 @@ def render_first_page(pdf: Path, output_path: Path, dpi: int) -> Path:
     return output_path
 
 
+def pdf_page_count(pdf: Path) -> int:
+    completed = subprocess.run(
+        ["pdfinfo", str(pdf)], check=True, capture_output=True, text=True
+    )
+    for line in completed.stdout.splitlines():
+        if line.startswith("Pages:"):
+            return int(line.split(":", 1)[1].strip())
+    raise ValueError("pdfinfo did not provide page count")
+
+
+def render_pages(pdf: Path, output_dir: Path, dpi: int) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    count = pdf_page_count(pdf)
+    prefix = output_dir / "page"
+    subprocess.run(
+        ["pdftoppm", "-r", str(dpi), "-png", "-f", "1", "-l", str(count), str(pdf), str(prefix)],
+        check=True,
+    )
+    pages = [prefix.with_name(f"page-{page}.png") for page in range(1, count + 1)]
+    if not all(page.exists() for page in pages):
+        raise FileNotFoundError("Poppler did not render all PDF pages")
+    return pages
+
+
+def has_usable_native_text(pdf: Path) -> bool:
+    """Skip OCR when Poppler finds a meaningful searchable text layer."""
+    try:
+        completed = subprocess.run(
+            ["pdftotext", "-layout", str(pdf), "-"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return sum(char.isalnum() for char in completed.stdout) >= 20
+
+
 def cached_result_is_current(
     output_path: Path, source_sha256: str, provider_name: str, dpi: int
 ) -> bool:
@@ -54,7 +92,7 @@ def cached_result_is_current(
         payload.get("sourceSha256") == source_sha256
         and payload.get("provider") == provider_name
         and payload.get("renderDpi") == dpi
-        and bool(payload.get("observations"))
+        and bool(payload.get("observations") or payload.get("pages"))
     )
 
 
@@ -83,11 +121,21 @@ def process_source_file(
     output_path = output_dir / f"{source.stem}.json"
     if cached_result_is_current(output_path, source_hash, provider.name, dpi):
         return output_path, json.loads(output_path.read_text(encoding="utf-8"))
-    image_path = source
+    image_paths = [source]
     if source.suffix.lower() == ".pdf":
-        image_path = render_first_page(source, pages_dir / f"{source.stem}.png", dpi)
-    result = provider.recognize(image_path)
-    payload = asdict(result)
+        image_paths = render_pages(source, pages_dir / source.stem, dpi)
+    page_results = [asdict(provider.recognize(image_path)) for image_path in image_paths]
+    payload = page_results[0] if len(page_results) == 1 else {
+        "width": page_results[0]["width"],
+        "height": page_results[0]["height"],
+        "recognitionLanguages": page_results[0]["recognitionLanguages"],
+        "provider": page_results[0]["provider"],
+        "observations": page_results[0]["observations"],
+        "pages": [
+            {"page": index, **result}
+            for index, result in enumerate(page_results, start=1)
+        ],
+    }
     payload.update(
         {
             "sourceFile": source.name,
@@ -116,9 +164,13 @@ def main() -> int:
     provider = provider_by_name(args.provider)
     processed = []
     cached = []
+    native_text = []
     failures = []
 
     for source in candidates:
+        if source.suffix.lower() == ".pdf" and has_usable_native_text(source):
+            native_text.append(source.name)
+            continue
         output_path = args.output_dir / f"{source.stem}.json"
         source_hash = sha256_file(source)
         if cached_result_is_current(output_path, source_hash, provider.name, args.dpi):
@@ -144,6 +196,7 @@ def main() -> int:
         "candidate_count": len(candidates),
         "processed": processed,
         "cached": cached,
+        "native_text": native_text,
         "failures": failures,
     }
     (args.output_dir / "manifest.json").write_text(

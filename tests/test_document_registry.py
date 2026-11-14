@@ -7,6 +7,10 @@ import unittest
 from pathlib import Path
 
 from financial_verification.document_registry import (
+    Evidence,
+    ExtractedContent,
+    extract_amount,
+    extract_date_or_period,
     build_base_records,
     extract_ocr,
     mark_duplicates,
@@ -20,6 +24,54 @@ RESULT_PATH = PROJECT_DIR / "artifacts/case19-registry/results/document-registry
 
 
 class DocumentRegistryUnitTest(unittest.TestCase):
+    @staticmethod
+    def content_for(text: str) -> ExtractedContent:
+        lines = text.splitlines()
+        return ExtractedContent(
+            text=text,
+            lines=lines,
+            evidence_by_line=[
+                Evidence("synthetic.txt", f"line:{index}", line)
+                for index, line in enumerate(lines, 1)
+            ],
+        )
+
+    def test_amount_accepts_whole_ruble_literal_without_turning_dates_into_money(self) -> None:
+        content = self.content_for("Дата: 10.04.2026\nИтого к оплате: 245 000 руб.")
+        amount, _ = extract_amount(content)
+        self.assertEqual(amount, 245000)
+        self.assertFalse(content.extraction_issues)
+
+    def test_amount_with_competing_vat_and_total_is_sent_to_review(self) -> None:
+        content = self.content_for(
+            "Сумма без НДС: 100 000,00 руб.\n"
+            "Сумма НДС: 20 000,00 руб.\n"
+            "Итого: 120 000,00 руб."
+        )
+        amount, evidence = extract_amount(content)
+        self.assertIsNone(amount)
+        self.assertIsNone(evidence)
+        self.assertIn("AMBIGUOUS_VAT_AMOUNT", content.extraction_issues)
+
+    def test_table_amount_header_applies_to_following_row(self) -> None:
+        content = self.content_for("Основание | Сумма, руб.\nКалибровка | 270 000,00")
+        amount, _ = extract_amount(content)
+        self.assertEqual(amount, 270000)
+
+    def test_period_label_beats_unrelated_document_date(self) -> None:
+        content = self.content_for(
+            "Дата составления: 05.06.2026\nЗа период: май 2026\n"
+        )
+        document_date, period_from, period_to, _ = extract_date_or_period(content, "source.txt")
+        self.assertEqual(document_date, "2026-06-05")
+        self.assertEqual(period_from, "2026-05-01")
+        self.assertEqual(period_to, "2026-05-31")
+
+    def test_conflicting_unlabelled_dates_are_not_chosen_by_position(self) -> None:
+        content = self.content_for("01.01.2026\n15.05.2026")
+        self.assertEqual(extract_date_or_period(content, "source.txt"), (None, None, None, None))
+        self.assertIn("AMBIGUOUS_DATE_OR_PERIOD", content.extraction_issues)
+
     def test_ocr_words_are_grouped_into_visual_lines(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

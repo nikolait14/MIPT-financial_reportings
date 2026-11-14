@@ -38,8 +38,11 @@ services:
       MAX_TOTAL_SIZE_BYTES: ${MAX_TOTAL_SIZE_BYTES:-262144000}
       JOB_WORKERS: "1"
       PIPELINE_STAGE_TIMEOUT_SECONDS: ${PIPELINE_STAGE_TIMEOUT_SECONDS:-600}
+      API_SESSION_TTL_SECONDS: ${API_SESSION_TTL_SECONDS:-1800}
+      # Development-only HTTP profile. A public deployment terminates TLS and sets true.
+      API_SESSION_COOKIE_SECURE: ${API_SESSION_COOKIE_SECURE:-false}
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "${API_BIND_HOST:-127.0.0.1}:${API_PORT:-8000}:8000"
     volumes:
       - ${CONFIG_DIR:-./config}:/workspace/config:ro
       - ${STORAGE_DIR:-./storage}:/workspace/storage

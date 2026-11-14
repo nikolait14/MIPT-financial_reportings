@@ -239,7 +239,7 @@ def main() -> None:
         args.image,
         ocr,
         context["target_row_label"],
-        context["report_row_fields"],
+        [field if isinstance(field, str) else field["field_id"] for field in context["report_row_fields"]],
         args.output_dir,
     )
     print(json.dumps({"row_bbox": metadata["row_bbox"], "cells": len(metadata["cells"])}))

@@ -15,6 +15,7 @@ from typing import Any
 
 from financial_verification.kfz_regions import prepare_regions
 from financial_verification.ocr import OCRObservation, OCRResult, provider_by_name, write_result
+from financial_verification.report_schema import report_field_ids
 
 
 def normalize_number(text: str) -> str | None:
@@ -149,7 +150,7 @@ def run_attempt(
         page,
         full_payload,
         context["target_row_label"],
-        context["report_row_fields"],
+        report_field_ids(context),
         attempt_dir,
     )
     if strategy == "region_first":

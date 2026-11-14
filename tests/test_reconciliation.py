@@ -18,6 +18,7 @@ from financial_verification.reconciliation import (
     reconcile,
     run,
 )
+from financial_verification.report_schema import article_report_fields, report_field_ids
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -125,6 +126,7 @@ ARTICLE_FIELDS = {
 
 def synthetic_context(*, detail_checks: list[dict] | None = None) -> dict:
     return {
+        "report_row_fields": [*ARTICLE_FIELDS.values(), "row_total"],
         "article_report_fields": ARTICLE_FIELDS,
         "total_report_field": "row_total",
         "detail_aggregation_checks": detail_checks or [],
@@ -201,6 +203,67 @@ def synthetic_operation(
 
 
 class ReconciliationEdgeCaseTest(unittest.TestCase):
+    def test_unknown_article_is_visible_and_not_coerced_to_zero(self) -> None:
+        context = synthetic_context()
+        context["report_row_fields"] = [
+            {"field_id": "materials", "field_name": "Материальные затраты", "article_code": "0400"},
+            *context["report_row_fields"],
+        ]
+        fields = synthetic_report_fields(
+            {code: "25.00" for code in ARTICLE_FIELDS},
+            "120.00",
+            {"materials": "20.00"},
+        )
+        operations = [
+            synthetic_operation(f"op-{code}", "25.00", code)
+            for code in ARTICLE_FIELDS
+        ]
+
+        result = reconcile(operations, fields, context, synthetic_rules())
+
+        unknown = next(item for item in result["articles"] if item["article_code"] == "0400")
+        self.assertFalse(unknown["article_supported"])
+        self.assertEqual(unknown["status"], "INSUFFICIENT_DATA")
+        self.assertEqual(unknown["reason_code"], "UNSUPPORTED_ARTICLE")
+        self.assertIsNone(unknown["supported_value"])
+        self.assertIsNone(unknown["delta_report_minus_supported"])
+        self.assertEqual(unknown["report_value"], "20.00")
+        self.assertEqual(result["report_consistency"]["article_sum"], "120.00")
+        self.assertEqual(result["conclusion"]["status"], "INSUFFICIENT_DATA")
+
+    def test_article_mapping_can_be_declared_by_report_field_metadata(self) -> None:
+        context = {
+            "report_row_fields": [
+                {"field_id": "materials", "article_code": "0400"},
+                "row_total",
+            ],
+            "article_report_fields": {},
+        }
+        self.assertEqual(report_field_ids(context), ["materials", "row_total"])
+        self.assertEqual(article_report_fields(context), {"0400": "materials"})
+
+    def test_known_review_amount_cannot_hide_a_mismatch_outside_its_interval(self) -> None:
+        fields = synthetic_report_fields(
+            {"0200": "25.00", "0300": "25.00", "0800": "100.00", "0900": "25.00"},
+            "175.00",
+        )
+        operations = [
+            synthetic_operation("op-0200", "25.00", "0200"),
+            synthetic_operation("op-0300", "25.00", "0300"),
+            synthetic_operation("op-0800", "50.00", "0800"),
+            synthetic_operation("op-0900", "25.00", "0900"),
+            synthetic_operation("review", "10.00", None),
+        ]
+
+        result = reconcile(operations, fields, synthetic_context(), synthetic_rules())
+
+        overhead = next(item for item in result["articles"] if item["article_code"] == "0800")
+        self.assertEqual(overhead["status"], "MISMATCH")
+        self.assertEqual(overhead["supported_value"], "50.00")
+        self.assertEqual(overhead["supported_value_upper_bound"], "60.00")
+        self.assertEqual(overhead["delta_report_minus_supported"], "40.00")
+        self.assertEqual(result["conclusion"]["status"], "REPORT_UNRELIABLE")
+
     def test_no_documents_is_insufficient_data_not_financial_mismatch(self) -> None:
         fields = synthetic_report_fields(
             {code: "25.00" for code in ARTICLE_FIELDS}, "100.00"

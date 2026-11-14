@@ -323,6 +323,9 @@ class BackendApiTest(unittest.TestCase):
             manager = VerificationJobManager(settings, runner=StubRunner())
             app = create_app(settings, manager)
             with TestClient(app) as client:
+                web = client.get("/")
+                self.assertEqual(web.status_code, 200)
+                self.assertIn("Проверка достоверности КФЗ", web.text)
                 capabilities = client.get("/api/v1/capabilities").json()
                 self.assertEqual(capabilities["storage"]["mode"], "EPHEMERAL")
                 verification_id = self.create_job(client)

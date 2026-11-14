@@ -120,6 +120,11 @@ def build_verification_result(
             "content_access": content_access,
             "pages": page_artifacts.get(record["document_id"], []),
         }
+        for page in document["pages"]:
+            page["page_url"] = (
+                f"/api/v1/verifications/{verification_id}/documents/"
+                f"{record['document_id']}/pages/{page['page']}"
+            )
         if storage_mode == "PERSISTENT":
             document["content_url"] = (
                 f"/api/v1/verifications/{verification_id}/documents/"
@@ -196,6 +201,20 @@ def build_verification_result(
         )
 
     annotations: list[dict[str, Any]] = []
+    documents_by_id = {item["document_id"]: item for item in documents}
+    for evidence_item in evidence:
+        locator = evidence_item["locator"]
+        if locator.get("type") != "PAGE_REGION":
+            continue
+        document = documents_by_id.get(evidence_item["document_id"])
+        if document is None:
+            continue
+        page = next(
+            (item for item in document["pages"] if item["page"] == locator.get("page")),
+            None,
+        )
+        if page and page.get("status") == "AVAILABLE":
+            evidence_item["page_url"] = page["page_url"]
     for evidence_item in evidence:
         confidence = evidence_item.get("confidence")
         if confidence is not None and confidence < confidence_warning:

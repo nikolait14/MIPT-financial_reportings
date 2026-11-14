@@ -21,7 +21,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import ValidationError
 
 from financial_verification.backend.config import ApiSettings
@@ -55,6 +55,7 @@ from financial_verification.backend.tooling import (
 
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".docx", ".xlsx", ".txt"}
 CHUNK_SIZE = 1024 * 1024
+WEB_CLIENT_PATH = Path(__file__).with_name("web") / "index.html"
 
 
 def _safe_file_name(raw: str | None) -> str:
@@ -251,6 +252,12 @@ def create_app(
     )
     application.state.settings = resolved_settings
     application.state.manager = resolved_manager
+
+    @application.get("/", include_in_schema=False, response_model=None)
+    def web_client() -> Response:
+        if not WEB_CLIENT_PATH.exists():
+            return HTMLResponse("Web client is not installed", status_code=503)
+        return FileResponse(WEB_CLIENT_PATH, media_type="text/html; charset=utf-8")
 
     @application.get("/health/live")
     def health_live() -> dict[str, str]:

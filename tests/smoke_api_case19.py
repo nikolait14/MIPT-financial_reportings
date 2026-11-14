@@ -143,6 +143,7 @@ def main() -> int:
                     all(0 <= value <= 1 for value in bbox),
                     f"Report bbox is not normalized: {bbox}",
                 )
+                require(bool(evidence_payload.get("page_url")), str(evidence_payload))
 
         source_document = next(
             item

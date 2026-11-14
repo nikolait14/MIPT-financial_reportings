@@ -3,7 +3,6 @@
 /artifacts/case19-reconciliation/
 /artifacts/linux-ocr-*/
 /artifacts/linux-report-ocr*/
-/data/case-19/
 /storage/
 /poc/kfz-row-extraction/__pycache__/
-*.pyc
+*.pyc.DS_Store

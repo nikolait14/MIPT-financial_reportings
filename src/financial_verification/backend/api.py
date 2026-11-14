@@ -7,6 +7,7 @@ import json
 import secrets
 import tempfile
 import unicodedata
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
@@ -29,6 +30,7 @@ from financial_verification.backend.models import (
     AnnotateToolRequest,
     CapabilitiesResponse,
     JobStatus,
+    PossibleDuplicateDecisionInput,
     ReconcileToolRequest,
     StorageMode,
     StorageStatus,
@@ -45,17 +47,21 @@ from financial_verification.backend.service import (
     VerificationJobManager,
 )
 from financial_verification.backend.page_artifacts import resolve_page_path
+from financial_verification.backend.spreadsheet_preview import spreadsheet_preview
 from financial_verification.backend.tooling import (
     annotate_fields,
     extract_one_document,
     load_rules,
     reconcile_payload,
 )
+from financial_verification.document_registry import extract_docx
 
 
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".docx", ".xlsx", ".txt"}
 CHUNK_SIZE = 1024 * 1024
 WEB_CLIENT_PATH = Path(__file__).with_name("web") / "index.html"
+SPREADSHEET_PREVIEW_REQUEST_LIMIT = 20
+SPREADSHEET_PREVIEW_RATE_WINDOW_SECONDS = 60.0
 
 
 def _safe_file_name(raw: str | None) -> str:
@@ -82,6 +88,37 @@ def _safe_file_name(raw: str | None) -> str:
             },
         )
     return normalized
+
+
+def _custom_rules(raw: str | None, settings: ApiSettings) -> dict[str, Any] | None:
+    """Merge small, user-authored article rules into the reviewed base rules."""
+    if not raw or not raw.strip():
+        return None
+    try:
+        additions = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise HTTPException(422, detail={"code": "INVALID_ARTICLE_RULES", "message": "Настройки статей должны быть JSON-массивом."}) from error
+    if not isinstance(additions, list) or not additions or len(additions) > 20:
+        raise HTTPException(422, detail={"code": "INVALID_ARTICLE_RULES", "message": "Можно добавить от 1 до 20 статей."})
+    rules = load_rules(settings.default_rules_path)
+    for article in additions:
+        if not isinstance(article, dict):
+            raise HTTPException(422, detail={"code": "INVALID_ARTICLE_RULES", "message": "Каждая статья должна быть объектом."})
+        code, name, signals = article.get("code"), article.get("name"), article.get("signals")
+        if not isinstance(code, str) or not re.fullmatch(r"\d{4}", code):
+            raise HTTPException(422, detail={"code": "INVALID_ARTICLE_RULES", "message": "Код статьи состоит из четырёх цифр."})
+        if not isinstance(name, str) or not name.strip() or len(name) > 160:
+            raise HTTPException(422, detail={"code": "INVALID_ARTICLE_RULES", "message": "Укажите название статьи до 160 символов."})
+        if not isinstance(signals, list) or not signals or len(signals) > 20:
+            raise HTTPException(422, detail={"code": "INVALID_ARTICLE_RULES", "message": "У статьи должен быть 1–20 признаков."})
+        normalized = []
+        for index, signal in enumerate(signals, 1):
+            if not isinstance(signal, str) or not signal.strip() or len(signal) > 300:
+                raise HTTPException(422, detail={"code": "INVALID_ARTICLE_RULES", "message": "Признак должен быть непустой строкой до 300 символов."})
+            normalized.append({"id": f"custom_{code}_{index}", "pattern": re.escape(signal.strip()), "weight": 3})
+        rules["articles"][code] = {"name": name.strip(), "signals": normalized}
+    rules["version"] = f"{rules['version']}-session-custom"
+    return rules
 
 
 async def _write_upload(
@@ -317,6 +354,7 @@ def create_app(
         response: Response,
         context: Annotated[str, Form()],
         files: Annotated[list[UploadFile], File()],
+        article_rules: Annotated[str | None, Form()] = None,
     ) -> VerificationAccepted:
         if not files:
             raise HTTPException(
@@ -329,11 +367,17 @@ def create_app(
                 detail={"code": "TOO_MANY_FILES", "message": "Слишком много файлов."},
             )
         verification_context = _load_context(resolved_settings, context)
+        rules = _custom_rules(article_rules, resolved_settings)
         owner_session_hash = _get_or_create_session_hash(
             request, response, resolved_settings
         )
         job = resolved_manager.allocate(verification_context, owner_session_hash)
         assert job.workspace is not None
+        if rules is not None:
+            job.rules_path = job.workspace / "rules.json"
+            job.rules_path.write_text(
+                json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
         input_dir = job.workspace / "input"
         metadata = []
         seen: set[str] = set()
@@ -543,6 +587,101 @@ def create_app(
         return FileResponse(path, media_type=artifact.get("media_type", "image/png"))
 
     @application.get(
+        "/api/v1/verifications/{verification_id}/documents/{document_id}/spreadsheet"
+    )
+    def get_spreadsheet_preview(
+        verification_id: str, document_id: str, request: Request, sheet: str | None = None
+    ) -> dict[str, Any]:
+        job = _job_or_http(
+            resolved_manager,
+            verification_id,
+            _request_session_hash(request, resolved_settings),
+        )
+        if not job.result or job.workspace is None:
+            raise HTTPException(status_code=409, detail={"code": "RESULT_NOT_READY"})
+        if not resolved_manager.allow_spreadsheet_preview(
+            job,
+            limit=SPREADSHEET_PREVIEW_REQUEST_LIMIT,
+            window_seconds=SPREADSHEET_PREVIEW_RATE_WINDOW_SECONDS,
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "SPREADSHEET_PREVIEW_RATE_LIMITED",
+                    "message": "Слишком много запросов предпросмотра. Повторите позже.",
+                },
+            )
+        document = next(
+            (item for item in job.result["documents"] if item["document_id"] == document_id),
+            None,
+        )
+        if document is None or document.get("extension") != ".xlsx":
+            raise HTTPException(status_code=404, detail={"code": "SPREADSHEET_NOT_FOUND"})
+        input_dir = (job.workspace / "input").resolve()
+        path = (input_dir / document["file_name"]).resolve()
+        if path.parent != input_dir or not path.is_file():
+            raise HTTPException(status_code=410, detail={"code": "SPREADSHEET_EXPIRED"})
+        try:
+            return spreadsheet_preview(path, sheet)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail={"code": "SHEET_NOT_FOUND"}) from error
+        except Exception as error:  # noqa: BLE001 - unsafe/invalid workbook boundary
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "SPREADSHEET_PREVIEW_FAILED", "message": str(error)},
+            ) from error
+
+    @application.get(
+        "/api/v1/verifications/{verification_id}/documents/{document_id}/text-preview"
+    )
+    def get_document_text_preview(
+        verification_id: str, document_id: str, request: Request
+    ) -> dict[str, Any]:
+        job = _job_or_http(
+            resolved_manager,
+            verification_id,
+            _request_session_hash(request, resolved_settings),
+        )
+        if not job.result or job.workspace is None:
+            raise HTTPException(status_code=409, detail={"code": "RESULT_NOT_READY"})
+        document = next(
+            (item for item in job.result["documents"] if item["document_id"] == document_id),
+            None,
+        )
+        if document is None or document.get("extension") not in {".docx", ".txt"}:
+            raise HTTPException(status_code=404, detail={"code": "TEXT_PREVIEW_NOT_FOUND"})
+        input_dir = (job.workspace / "input").resolve()
+        path = (input_dir / document["file_name"]).resolve()
+        if path.parent != input_dir or not path.is_file():
+            raise HTTPException(status_code=410, detail={"code": "TEXT_PREVIEW_EXPIRED"})
+        try:
+            if path.suffix.lower() == ".docx":
+                content = extract_docx(path)
+                kind = "DOCX"
+            else:
+                lines = path.read_text(encoding="utf-8").splitlines()
+                return {
+                    "kind": "TEXT",
+                    "items": [
+                        {"locator": f"line:{index}", "text": line}
+                        for index, line in enumerate(lines, 1)
+                        if line.strip()
+                    ],
+                }
+            return {
+                "kind": kind,
+                "items": [
+                    {"locator": evidence.locator, "text": evidence.raw}
+                    for evidence in content.evidence_by_line
+                ],
+            }
+        except Exception as error:  # noqa: BLE001 - document preview boundary
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "TEXT_PREVIEW_FAILED", "message": str(error)},
+            ) from error
+
+    @application.get(
         "/api/v1/verifications/{verification_id}/evidence/{evidence_id:path}"
     )
     def get_evidence(
@@ -617,6 +756,41 @@ def create_app(
                     "message": "Для повторной проверки загрузите документы заново.",
                 },
             ) from error
+        return VerificationAccepted(
+            verification_id=job.verification_id,
+            status=job.status,
+            storage=_storage_status(resolved_manager, job),
+        )
+
+    @application.post(
+        "/api/v1/verifications/{verification_id}/possible-duplicate-decisions",
+        response_model=VerificationAccepted,
+        status_code=202,
+    )
+    def decide_possible_duplicate(
+        verification_id: str, payload: PossibleDuplicateDecisionInput, request: Request
+    ) -> VerificationAccepted:
+        source = _job_or_http(
+            resolved_manager, verification_id, _request_session_hash(request, resolved_settings)
+        )
+        if source.result is None:
+            raise HTTPException(409, detail={"code": "RESULT_NOT_READY"})
+        candidate = next(
+            (item for item in source.result["documents"]
+             if item["file_name"] == payload.file_name
+             and item.get("reason_code") == "POSSIBLE_DUPLICATE_DOCUMENT"),
+            None,
+        )
+        if candidate is None:
+            raise HTTPException(422, detail={"code": "POSSIBLE_DUPLICATE_NOT_FOUND", "message": "В текущем результате нет такого вероятного дубля."})
+        decisions = dict(source.context.get("possible_duplicate_decisions", {}))
+        decisions[payload.file_name] = payload.decision
+        try:
+            job = resolved_manager.rerun(
+                verification_id, context_patch={"possible_duplicate_decisions": decisions}
+            )
+        except JobConflictError as error:
+            raise HTTPException(409, detail={"code": "SOURCE_DOCUMENTS_NOT_AVAILABLE", "message": str(error)}) from error
         return VerificationAccepted(
             verification_id=job.verification_id,
             status=job.status,

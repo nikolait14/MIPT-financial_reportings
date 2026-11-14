@@ -53,6 +53,8 @@ def _locator_from_registry_evidence(
     if locator.startswith("page:"):
         page = int(locator.split(":")[1])
         width, height = dimensions or (None, None)
+        if bbox and width is None and all(0 <= float(value) <= 1 for value in bbox):
+            return {"type": "PAGE_REGION", "page": page, "bbox": bbox}
         return {
             "type": "PAGE_REGION",
             "page": page,
@@ -320,16 +322,26 @@ def build_verification_result(
                 }
             )
         elif record["decision"] == "REVIEW":
+            possible_duplicate = record["reason_code"] == "POSSIBLE_DUPLICATE_DOCUMENT"
             annotations.append(
                 {
                     "annotation_id": f"review:{record['document_id']}",
                     "document_id": record["document_id"],
-                    "category": "EXTRACTION_WARNING",
+                    "category": "POSSIBLE_DUPLICATE" if possible_duplicate else "EXTRACTION_WARNING",
                     "severity": "WARNING",
-                    "message": "Документ требует ручной или технической проверки.",
+                    "message": (
+                        "Вероятный пересохраненный дубль: совпали реквизиты "
+                        f"{', '.join(record.get('possible_duplicate_match_fields', []))}."
+                        if possible_duplicate
+                        else "Документ требует ручной или технической проверки."
+                    ),
                     "target": {"type": "DOCUMENT"},
                     "reason_code": record["reason_code"],
                     "warnings": record["warnings"],
+                    "possible_duplicate_of": record.get("possible_duplicate_of"),
+                    "possible_duplicate_match_fields": record.get(
+                        "possible_duplicate_match_fields", []
+                    ),
                 }
             )
 
@@ -482,6 +494,27 @@ def render_informative_markdown(result: dict[str, Any]) -> str:
             )
     else:
         lines.append("| — | Исключенных документов нет | — |")
+
+    review_documents = [
+        document
+        for document in result["documents"]
+        if document["role"] == "SOURCE_DOCUMENT" and document["decision"] == "REVIEW"
+    ]
+    if review_documents:
+        lines.extend(
+            [
+                "",
+                "## Документы, требующие проверки",
+                "",
+                "| Документ | Причина | Совпавшие реквизиты |",
+                "|---|---|---|",
+            ]
+        )
+        for document in review_documents:
+            lines.append(
+                f"| `{document['file_name']}` | {document['reason_code']} | "
+                f"{', '.join(document.get('possible_duplicate_match_fields', [])) or '—'} |"
+            )
 
     lines.extend(
         [

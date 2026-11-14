@@ -66,6 +66,13 @@ class VerificationAccepted(BaseModel):
     storage: StorageStatus
 
 
+class PossibleDuplicateDecisionInput(BaseModel):
+    """A human decision for a non-binary duplicate candidate."""
+
+    file_name: str = Field(min_length=1, max_length=255)
+    decision: Literal["INCLUDE", "EXCLUDE"]
+
+
 class VerificationStatusResponse(BaseModel):
     verification_id: str
     status: JobStatus

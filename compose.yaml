@@ -133,6 +133,16 @@ services:
       - ${ARTIFACTS_DIR:-./artifacts}:/app/artifacts:ro
       - ${CONFIG_DIR:-./config}:/app/config:ro
 
+  smoke-api:
+    <<: *runtime
+    entrypoint: ["python", "/app/tests/smoke_api_case19.py"]
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - ${DATA_DIR:-./data}:/app/data:ro
+      - ${CONFIG_DIR:-./config}:/app/config:ro
+
   ocr-benchmark:
     <<: *runtime
     entrypoint: ["python", "/app/poc/linux-ocr-benchmark/run_benchmark.py"]

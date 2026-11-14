@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -62,6 +63,8 @@ class JobRecord:
     markdown: str | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
     input_files: list[dict[str, Any]] = field(default_factory=list)
+    rules_path: Path | None = None
+    spreadsheet_preview_requests: list[float] = field(default_factory=list, repr=False)
 
     def manifest(self, storage_mode: str) -> dict[str, Any]:
         return {
@@ -77,6 +80,7 @@ class JobRecord:
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
             "error": self.error,
             "input_files": self.input_files,
+            "has_custom_rules": self.rules_path is not None,
             "storage_mode": storage_mode,
         }
 
@@ -116,6 +120,22 @@ class VerificationJobManager:
     def storage_mode(self) -> str:
         return "PERSISTENT" if self.settings.is_persistent else "EPHEMERAL"
 
+    def allow_spreadsheet_preview(
+        self, job: JobRecord, *, limit: int, window_seconds: float
+    ) -> bool:
+        """Apply an in-memory per-job rate limit without persisting document data."""
+        now = time.monotonic()
+        with self._lock:
+            job.spreadsheet_preview_requests[:] = [
+                request_time
+                for request_time in job.spreadsheet_preview_requests
+                if now - request_time < window_seconds
+            ]
+            if len(job.spreadsheet_preview_requests) >= limit:
+                return False
+            job.spreadsheet_preview_requests.append(now)
+            return True
+
     def _load_persistent_jobs(self) -> None:
         assert isinstance(self.storage, PersistentWorkspaceStore)
         for manifest in self.storage.load_manifests():
@@ -139,6 +159,11 @@ class VerificationJobManager:
                     ),
                     error=manifest.get("error"),
                     input_files=manifest.get("input_files", []),
+                    rules_path=(
+                        self.storage.run_path(manifest["verification_id"]) / "rules.json"
+                        if manifest.get("has_custom_rules")
+                        else None
+                    ),
                 )
                 loaded = self.storage.load_result(job.verification_id)
                 if loaded:
@@ -216,7 +241,7 @@ class VerificationJobManager:
             output = self.runner.run(
                 workspace=job.workspace,
                 context=job.context,
-                rules_path=self.settings.default_rules_path,
+                rules_path=job.rules_path or self.settings.default_rules_path,
                 progress=lambda stage, progress, message: self._update(
                     job, JobStatus.PROCESSING, stage, progress, message
                 ),
@@ -364,18 +389,23 @@ class VerificationJobManager:
             job.status = JobStatus.DELETED
             self._jobs.pop(verification_id, None)
 
-    def rerun(self, verification_id: str) -> JobRecord:
-        if not self.settings.is_persistent:
-            raise JobConflictError("Source documents are not available")
+    def rerun(
+        self, verification_id: str, *, context_patch: dict[str, Any] | None = None
+    ) -> JobRecord:
         source = self.get(verification_id)
         if source.workspace is None or not (source.workspace / "input").exists():
             raise JobConflictError("Source documents are not available")
-        target = self.allocate(dict(source.context), source.owner_session_hash)
+        context = dict(source.context)
+        context.update(context_patch or {})
+        target = self.allocate(context, source.owner_session_hash)
         assert target.workspace is not None
         for path in (source.workspace / "input").iterdir():
             if path.is_file():
                 shutil.copy2(path, target.workspace / "input" / path.name)
         target.input_files = list(source.input_files)
+        if source.rules_path and source.rules_path.is_file():
+            target.rules_path = target.workspace / "rules.json"
+            shutil.copy2(source.rules_path, target.rules_path)
         self._persist_manifest(target)
         self.submit(target.verification_id)
         return target

@@ -10,9 +10,11 @@ from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from fastapi.testclient import TestClient
 from PIL import Image
+from openpyxl import Workbook
 
 from financial_verification.backend.api import create_app
 from financial_verification.backend.config import ApiSettings
@@ -23,6 +25,7 @@ from financial_verification.backend.pipeline_adapter import (
 )
 from financial_verification.backend.service import VerificationJobManager, utc_now
 from financial_verification.backend.page_artifacts import build_page_artifacts
+from financial_verification.backend.spreadsheet_preview import spreadsheet_preview
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -228,6 +231,64 @@ class FailingRunner:
 
 
 class BackendApiTest(unittest.TestCase):
+    def test_spreadsheet_preview_exposes_cells_formula_and_sheets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Расчет"
+            sheet["A1"] = "Сумма"
+            sheet["B1"] = 40
+            sheet["B2"] = 60
+            sheet["B3"] = "=SUM(B1:B2)"
+            workbook.create_sheet("Дополнительно")
+            path = Path(directory) / "calc.xlsx"
+            workbook.save(path)
+            preview = spreadsheet_preview(path, "Расчет")
+            self.assertEqual(preview["sheets"], ["Расчет", "Дополнительно"])
+            self.assertEqual(preview["rows"][2][1]["value"], "100")
+            self.assertEqual(preview["rows"][2][1]["formula"], "=SUM(B1:B2)")
+            self.assertEqual(preview["rows"][2][1]["coordinate"], "B3")
+
+    def test_spreadsheet_preview_is_bounded_without_losing_coordinates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet["A1"] = "start"
+            sheet["AO121"] = "end"
+            path = Path(directory) / "large.xlsx"
+            workbook.save(path)
+
+            preview = spreadsheet_preview(path)
+
+            self.assertTrue(preview["truncated"])
+            self.assertEqual(len(preview["rows"]), 120)
+            self.assertEqual(len(preview["columns"]), 40)
+            self.assertEqual(preview["range"], "A1:AN120")
+            self.assertEqual(preview["rows"][0][0]["coordinate"], "A1")
+            self.assertEqual(preview["rows"][-1][-1]["coordinate"], "AN120")
+
+    def test_spreadsheet_preview_does_not_evaluate_huge_formula_ranges(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet["A1"] = "=SUM(A1:XFD1048576)"
+            path = Path(directory) / "huge-formula.xlsx"
+            workbook.save(path)
+
+            preview = spreadsheet_preview(path)
+
+            self.assertEqual(preview["rows"][0][0]["formula"], "=SUM(A1:XFD1048576)")
+            self.assertEqual(preview["rows"][0][0]["value"], "=SUM(A1:XFD1048576)")
+
+    def test_spreadsheet_preview_rejects_high_compression_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "compressed.xlsx"
+            with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+                archive.writestr("xl/sharedStrings.xml", b"0" * (1024 * 1024))
+
+            with self.assertRaisesRegex(ValueError, "коэффициент сжатия"):
+                spreadsheet_preview(path)
+
     def test_page_artifacts_render_all_pdf_pages_and_detect_text_absence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -316,6 +377,110 @@ class BackendApiTest(unittest.TestCase):
                 "artifact_path": "artifacts/page-previews/source-id/page-1.png",
             }
         ]
+
+    @staticmethod
+    def install_spreadsheet(manager: VerificationJobManager, verification_id: str) -> None:
+        """Install a controlled XLSX input for protected preview endpoint tests."""
+        job = manager.get(verification_id)
+        assert job.workspace is not None and job.result is not None
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Расчет"
+        sheet["B1"] = 40
+        sheet["B2"] = 60
+        sheet["B3"] = "=SUM(B1:B2)"
+        workbook.create_sheet("Дополнительно")
+        workbook.save(job.workspace / "input" / "calc.xlsx")
+        job.result["documents"].append(
+            {
+                "document_id": "calc-id",
+                "file_name": "calc.xlsx",
+                "extension": ".xlsx",
+            }
+        )
+
+    @staticmethod
+    def install_text_document(manager: VerificationJobManager, verification_id: str) -> None:
+        job = manager.get(verification_id)
+        assert job.workspace is not None and job.result is not None
+        (job.workspace / "input" / "note.txt").write_text("Строка доказательства\n", encoding="utf-8")
+        job.result["documents"].append(
+            {"document_id": "note-id", "file_name": "note.txt", "extension": ".txt"}
+        )
+
+    def test_text_preview_returns_structured_text_without_original_download(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = self.make_settings(Path(directory))
+            manager = VerificationJobManager(settings, runner=StubRunner())
+            app = create_app(settings, manager)
+            with TestClient(app) as client:
+                verification_id = self.create_job(client)
+                self.assertEqual(self.wait(client, verification_id)["status"], "COMPLETED")
+                self.install_text_document(manager, verification_id)
+                preview = client.get(
+                    f"/api/v1/verifications/{verification_id}/documents/note-id/text-preview"
+                )
+                self.assertEqual(preview.status_code, 200, preview.text)
+                self.assertEqual(preview.json()["items"][0], {"locator": "line:1", "text": "Строка доказательства"})
+
+    def test_spreadsheet_endpoint_is_session_scoped_and_reports_sheet_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = self.make_settings(Path(directory))
+            manager = VerificationJobManager(settings, runner=StubRunner())
+            app = create_app(settings, manager)
+            with TestClient(app) as owner:
+                verification_id = self.create_job(owner)
+                self.assertEqual(self.wait(owner, verification_id)["status"], "COMPLETED")
+                self.install_spreadsheet(manager, verification_id)
+
+                preview = owner.get(
+                    f"/api/v1/verifications/{verification_id}/documents/calc-id/spreadsheet",
+                    params={"sheet": "Расчет"},
+                )
+                self.assertEqual(preview.status_code, 200, preview.text)
+                self.assertEqual(preview.json()["rows"][2][0]["value"], "100")
+                self.assertEqual(preview.json()["rows"][2][0]["formula"], "=SUM(B1:B2)")
+
+                missing_sheet = owner.get(
+                    f"/api/v1/verifications/{verification_id}/documents/calc-id/spreadsheet",
+                    params={"sheet": "Нет такого листа"},
+                )
+                self.assertEqual(missing_sheet.status_code, 404)
+                self.assertEqual(missing_sheet.json()["detail"]["code"], "SHEET_NOT_FOUND")
+
+                intruder = TestClient(app)
+                try:
+                    forbidden = intruder.get(
+                        f"/api/v1/verifications/{verification_id}/documents/calc-id/spreadsheet"
+                    )
+                    self.assertEqual(forbidden.status_code, 404)
+                    self.assertEqual(
+                        forbidden.json()["detail"]["code"], "VERIFICATION_NOT_FOUND"
+                    )
+                finally:
+                    intruder.close()
+
+    def test_spreadsheet_endpoint_rate_limits_repeated_preview_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = self.make_settings(Path(directory))
+            manager = VerificationJobManager(settings, runner=StubRunner())
+            app = create_app(settings, manager)
+            with TestClient(app) as client:
+                verification_id = self.create_job(client)
+                self.assertEqual(self.wait(client, verification_id)["status"], "COMPLETED")
+                self.install_spreadsheet(manager, verification_id)
+                endpoint = (
+                    f"/api/v1/verifications/{verification_id}/documents/calc-id/spreadsheet"
+                )
+                with mock.patch(
+                    "financial_verification.backend.api.SPREADSHEET_PREVIEW_REQUEST_LIMIT", 1
+                ):
+                    self.assertEqual(client.get(endpoint).status_code, 200)
+                    limited = client.get(endpoint)
+                self.assertEqual(limited.status_code, 429)
+                self.assertEqual(
+                    limited.json()["detail"]["code"], "SPREADSHEET_PREVIEW_RATE_LIMITED"
+                )
 
     def test_ephemeral_verification_result_and_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

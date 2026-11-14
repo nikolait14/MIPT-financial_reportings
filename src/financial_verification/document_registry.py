@@ -11,6 +11,7 @@ import re
 import statistics
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -91,6 +92,8 @@ class DocumentRecord:
     decision: str
     reason_code: str
     duplicate_of: str | None = None
+    possible_duplicate_of: str | None = None
+    possible_duplicate_match_fields: list[str] = field(default_factory=list)
     document_number: str | None = None
     contract_number: str | None = None
     document_date: str | None = None
@@ -333,23 +336,43 @@ def extract_pdf_text(path: Path) -> ExtractedContent | None:
     """Read a searchable PDF before using OCR; retain page-level locators."""
     try:
         completed = subprocess.run(
-            ["pdftotext", "-layout", str(path), "-"],
+            ["pdftotext", "-bbox-layout", str(path), "-"],
             check=True,
             capture_output=True,
             text=True,
         )
+        root = ET.fromstring(completed.stdout)
     except (OSError, subprocess.CalledProcessError):
         return None
-    pages = completed.stdout.split("\f")
+    except ET.ParseError:
+        return None
     lines: list[str] = []
     evidence: list[Evidence] = []
-    for page_number, page_text in enumerate(pages, start=1):
-        for line_number, raw in enumerate(page_text.splitlines(), start=1):
-            text = raw.strip()
+    namespace = {"pdf": "http://www.w3.org/1999/xhtml"}
+    pages = root.findall(".//page") or root.findall(".//pdf:page", namespace)
+    for page_number, page in enumerate(pages, start=1):
+        page_width = float(page.attrib.get("width", "0"))
+        page_height = float(page.attrib.get("height", "0"))
+        page_lines = page.findall(".//line") or page.findall(".//pdf:line", namespace)
+        for line_number, line in enumerate(page_lines, start=1):
+            words = line.findall("word") or line.findall("pdf:word", namespace)
+            text = " ".join((word.text or "").strip() for word in words).strip()
             if not text:
                 continue
             lines.append(text)
-            evidence.append(Evidence(path.name, f"page:{page_number}:line:{line_number}", text))
+            try:
+                left = min(float(word.attrib["xMin"]) for word in words)
+                top = min(float(word.attrib["yMin"]) for word in words)
+                right = max(float(word.attrib["xMax"]) for word in words)
+                bottom = max(float(word.attrib["yMax"]) for word in words)
+                bbox = (
+                    [left / page_width, top / page_height, (right - left) / page_width, (bottom - top) / page_height]
+                    if page_width > 0 and page_height > 0
+                    else [int(left), int(top), int(right - left), int(bottom - top)]
+                )
+            except (KeyError, ValueError):
+                bbox = None
+            evidence.append(Evidence(path.name, f"page:{page_number}:line:{line_number}", text, bbox))
     # A few isolated glyphs are not a usable text layer and should not prevent
     # OCR from reading a scan with a broken hidden layer.
     meaningful = sum(char.isalnum() for line in lines for char in line)
@@ -478,12 +501,22 @@ def extract_amount(content: ExtractedContent) -> tuple[Decimal | None, Evidence 
     strongest_keywords = ("итого", "всего", "к оплате", "к перечислению")
     candidates: list[tuple[int, Decimal, str, Evidence | None]] = []
     explicit_currency: set[str] = set()
-    has_unsupported_unit = False
     previous_line_has_amount_label = False
     for line in content.lines:
         line_lower = line.lower()
-        if any(marker in line_lower for marker in ("тыс. руб", "тысяч рублей", "млн руб")):
-            has_unsupported_unit = True
+        unit_markers = [
+            ("million", Decimal("1000000"))
+            for marker in ("млн руб", "миллион рублей")
+            if marker in line_lower
+        ] + [
+            ("thousand", Decimal("1000"))
+            for marker in ("тыс. руб", "тысяч рублей")
+            if marker in line_lower
+        ]
+        if len(unit_markers) > 1:
+            _set_issue(content, "AMBIGUOUS_AMOUNT_UNIT")
+            return None, None
+        multiplier = unit_markers[0][1] if unit_markers else Decimal("1")
         if any(marker in line_lower for marker in ("usd", "долл", "$")):
             explicit_currency.add("USD")
         if any(marker in line_lower for marker in ("eur", "евро", "€")):
@@ -515,14 +548,18 @@ def extract_amount(content: ExtractedContent) -> tuple[Decimal | None, Evidence 
             value = normalize_decimal(match.group(0))
             if value is not None:
                 has_non_date_money = True
-                candidates.append((score, value, match.group(0), find_evidence(content, line)))
+                candidates.append(
+                    (
+                        score,
+                        (value * multiplier).quantize(Decimal("0.01")),
+                        match.group(0),
+                        find_evidence(content, line),
+                    )
+                )
         previous_line_has_amount_label = (
             any(keyword in line_lower for keyword in keywords) and not has_non_date_money
         )
 
-    if has_unsupported_unit:
-        _set_issue(content, "UNSUPPORTED_AMOUNT_UNIT")
-        return None, None
     if explicit_currency - {"RUB"}:
         _set_issue(content, "UNSUPPORTED_CURRENCY")
         return None, None
@@ -613,6 +650,93 @@ def mark_duplicates(records: list[DocumentRecord]) -> None:
         record.processing_status = "PROCESSED"
         record.decision = "EXCLUDE"
         record.reason_code = "DUPLICATE_DOCUMENT"
+
+
+def _possible_duplicate_match_fields(
+    original: DocumentRecord, candidate: DocumentRecord
+) -> list[str]:
+    """Return strong business-identity matches, never a fuzzy auto-decision."""
+    matches = []
+    for attribute, label in (
+        ("document_number", "document_number"),
+        ("contract_number", "contract_number"),
+        ("amount", "amount"),
+    ):
+        value = getattr(original, attribute)
+        if value and value == getattr(candidate, attribute):
+            matches.append(label)
+    same_date = original.document_date and original.document_date == candidate.document_date
+    same_period = (
+        original.period_from
+        and original.period_to
+        and original.period_from == candidate.period_from
+        and original.period_to == candidate.period_to
+    )
+    if same_date:
+        matches.append("document_date")
+    elif same_period:
+        matches.append("period")
+    return matches
+
+
+def mark_possible_duplicates(records: list[DocumentRecord]) -> None:
+    """Route re-saved document candidates to REVIEW without excluding them.
+
+    Binary-identical files have already been excluded by ``mark_duplicates``.
+    Here we require four independent strong requisites before treating two
+    differently encoded files as possible copies.  A human confirms the pair;
+    the candidate is never silently discarded or summed.
+    """
+    originals: list[DocumentRecord] = []
+    for record in records:
+        if (
+            record.role != "SOURCE_DOCUMENT"
+            or record.reason_code == "DUPLICATE_DOCUMENT"
+        ):
+            continue
+        if record.decision != "INCLUDE":
+            continue
+        matched_original = next(
+            (
+                original
+                for original in originals
+                if len(_possible_duplicate_match_fields(original, record)) == 4
+            ),
+            None,
+        )
+        if matched_original is not None:
+            record.possible_duplicate_of = matched_original.document_id
+            record.possible_duplicate_match_fields = _possible_duplicate_match_fields(
+                matched_original, record
+            )
+            record.decision = "REVIEW"
+            record.reason_code = "POSSIBLE_DUPLICATE_DOCUMENT"
+            record.warnings.append("POSSIBLE_DUPLICATE_DOCUMENT")
+            continue
+        originals.append(record)
+
+
+def apply_manual_possible_duplicate_decisions(
+    records: list[DocumentRecord], context: dict[str, Any]
+) -> None:
+    """Apply only explicit INCLUDE/EXCLUDE decisions to REVIEW candidates."""
+    decisions = context.get("possible_duplicate_decisions", {})
+    if not isinstance(decisions, dict):
+        return
+    for record in records:
+        decision = decisions.get(record.file_name)
+        if record.reason_code != "POSSIBLE_DUPLICATE_DOCUMENT" or decision not in {
+            "INCLUDE",
+            "EXCLUDE",
+        }:
+            continue
+        record.decision = decision
+        record.reason_code = (
+            "MANUAL_POSSIBLE_DUPLICATE_INCLUDED"
+            if decision == "INCLUDE"
+            else "MANUAL_POSSIBLE_DUPLICATE_EXCLUDED"
+        )
+        record.warnings.append(record.reason_code)
 
 
 def apply_context_decision(record: DocumentRecord, context: dict[str, Any]) -> None:
@@ -763,6 +887,8 @@ def write_outputs(records: list[DocumentRecord], context: dict[str, Any], output
         "decision",
         "reason_code",
         "duplicate_of",
+        "possible_duplicate_of",
+        "possible_duplicate_match_fields",
         "processing_status",
     ]
     with (output_dir / "document-registry.csv").open("w", encoding="utf-8", newline="") as handle:
@@ -802,6 +928,8 @@ def main() -> int:
     records = build_base_records(args.input_dir, context)
     mark_duplicates(records)
     process_records(args.input_dir, args.ocr_dir, context, records)
+    mark_possible_duplicates(records)
+    apply_manual_possible_duplicate_decisions(records, context)
     write_outputs(records, context, args.output_dir)
     summary = json.loads((args.output_dir / "document-registry.json").read_text())["summary"]
     print(json.dumps(summary, ensure_ascii=False))

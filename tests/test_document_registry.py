@@ -5,6 +5,8 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from subprocess import CompletedProcess
+from unittest.mock import patch
 
 from financial_verification.document_registry import (
     Evidence,
@@ -13,7 +15,10 @@ from financial_verification.document_registry import (
     extract_date_or_period,
     build_base_records,
     extract_ocr,
+    extract_pdf_text,
+    apply_manual_possible_duplicate_decisions,
     mark_duplicates,
+    mark_possible_duplicates,
     process_records,
 )
 from financial_verification.source_ocr_pipeline import cached_result_is_current
@@ -41,6 +46,12 @@ class DocumentRegistryUnitTest(unittest.TestCase):
         amount, _ = extract_amount(content)
         self.assertEqual(amount, 245000)
         self.assertFalse(content.extraction_issues)
+
+    def test_amount_normalizes_negative_and_thousand_ruble_amounts(self) -> None:
+        thousand = self.content_for("Итого к оплате: 1,25 тыс. руб.")
+        negative = self.content_for("Корректировка, итого: -1 250,50 руб.")
+        self.assertEqual(extract_amount(thousand)[0], 1250)
+        self.assertEqual(str(extract_amount(negative)[0]), "-1250.50")
 
     def test_amount_with_competing_vat_and_total_is_sent_to_review(self) -> None:
         content = self.content_for(
@@ -151,6 +162,74 @@ class DocumentRegistryUnitTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "Stale OCR result"):
                 extract_ocr(source, ocr_dir)
+
+    def test_reencoded_document_is_reviewed_as_possible_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            common = (
+                "Документ: ADM-27\nДоговор: 24/03/15-01\n"
+                "Дата документа: 27.02.2026\nИтого: 487 500,00 руб.\n"
+            )
+            (root / "01_original.txt").write_text(
+                common + "Работы по договору.\n", encoding="utf-8"
+            )
+            (root / "02_resaved_copy.txt").write_text(
+                "Копия для внутреннего архива\n" + common, encoding="utf-8"
+            )
+            (root / "03_other_document.txt").write_text(
+                common.replace("ADM-27", "ADM-28"), encoding="utf-8"
+            )
+            context = {
+                "report_file": "report.pdf",
+                "target_row_label": "target",
+                "contract_number": "24/03/15-01",
+                "period_from": "2026-01-01",
+                "period_to": "2026-05-31",
+                "oracle_patterns": [],
+                "metadata_prefixes": [],
+            }
+            records = build_base_records(root, context)
+            mark_duplicates(records)
+            process_records(root, root / "ocr", context, records)
+            mark_possible_duplicates(records)
+            by_name = {record.file_name: record for record in records}
+
+            original = by_name["01_original.txt"]
+            candidate = by_name["02_resaved_copy.txt"]
+            self.assertEqual(original.decision, "INCLUDE")
+            self.assertEqual(candidate.decision, "REVIEW")
+            self.assertEqual(candidate.reason_code, "POSSIBLE_DUPLICATE_DOCUMENT")
+            self.assertEqual(candidate.possible_duplicate_of, original.document_id)
+            self.assertEqual(
+                candidate.possible_duplicate_match_fields,
+                ["document_number", "contract_number", "amount", "document_date"],
+            )
+            self.assertEqual(by_name["03_other_document.txt"].decision, "INCLUDE")
+
+            apply_manual_possible_duplicate_decisions(
+                records,
+                {"possible_duplicate_decisions": {candidate.file_name: "EXCLUDE"}},
+            )
+            self.assertEqual(candidate.decision, "EXCLUDE")
+            self.assertEqual(candidate.reason_code, "MANUAL_POSSIBLE_DUPLICATE_EXCLUDED")
+
+    def test_searchable_pdf_emits_normalized_bbox(self) -> None:
+        xml = """<doc><page width=\"200\" height=\"100\"><flow><block><line>
+        <word xMin=\"20\" yMin=\"10\" xMax=\"80\" yMax=\"30\">Сумма</word>
+        <word xMin=\"90\" yMin=\"10\" xMax=\"150\" yMax=\"30\">100000</word>
+        </line></block></flow></page></doc>"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "text.pdf"
+            path.write_bytes(b"pdf")
+            with patch(
+                "financial_verification.document_registry.subprocess.run",
+                return_value=CompletedProcess([], 0, xml, ""),
+            ):
+                content = extract_pdf_text(path)
+        self.assertIsNotNone(content)
+        assert content is not None
+        self.assertEqual(content.lines, ["Сумма 100000"])
+        self.assertEqual(content.evidence_by_line[0].bbox, [0.1, 0.1, 0.65, 0.2])
 
 
 @unittest.skipUnless(RESULT_PATH.exists(), "Run scripts/run_case19_registry.sh first")
